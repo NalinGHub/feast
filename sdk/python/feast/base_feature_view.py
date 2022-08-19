@@ -11,49 +11,77 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Optional, Type
+from typing import Dict, List, Optional, Type
 
 from google.protobuf.json_format import MessageToJson
 from proto import Message
 
-from feast.feature import Feature
 from feast.feature_view_projection import FeatureViewProjection
-
-warnings.simplefilter("once", DeprecationWarning)
+from feast.field import Field
 
 
 class BaseFeatureView(ABC):
-    """A FeatureView defines a logical grouping of features to be served."""
+    """
+    A BaseFeatureView defines a logical group of features.
+
+    Attributes:
+        name: The unique name of the base feature view.
+        features: The list of features defined as part of this base feature view.
+        description: A human-readable description.
+        tags: A dictionary of key-value pairs to store arbitrary metadata.
+        owner: The owner of the base feature view, typically the email of the primary
+            maintainer.
+        projection: The feature view projection storing modifications to be applied to
+            this base feature view at retrieval time.
+        created_timestamp (optional): The time when the base feature view was created.
+        last_updated_timestamp (optional): The time when the base feature view was last
+            updated.
+    """
+
+    name: str
+    features: List[Field]
+    description: str
+    tags: Dict[str, str]
+    owner: str
+    projection: FeatureViewProjection
+    created_timestamp: Optional[datetime]
+    last_updated_timestamp: Optional[datetime]
 
     @abstractmethod
-    def __init__(self, name: str, features: List[Feature]):
-        self._name = name
-        self._features = features
-        self._projection = FeatureViewProjection.from_definition(self)
-        self.created_timestamp: Optional[datetime] = None
+    def __init__(
+        self,
+        *,
+        name: str,
+        features: Optional[List[Field]] = None,
+        description: str = "",
+        tags: Optional[Dict[str, str]] = None,
+        owner: str = "",
+    ):
+        """
+        Creates a BaseFeatureView object.
 
-    @property
-    def name(self) -> str:
-        return self._name
+        Args:
+            name: The unique name of the base feature view.
+            features (optional): The list of features defined as part of this base feature view.
+            description (optional): A human-readable description.
+            tags (optional): A dictionary of key-value pairs to store arbitrary metadata.
+            owner (optional): The owner of the base feature view, typically the email of the
+                primary maintainer.
 
-    @property
-    def features(self) -> List[Feature]:
-        return self._features
-
-    @features.setter
-    def features(self, value):
-        self._features = value
-
-    @property
-    def projection(self) -> FeatureViewProjection:
-        return self._projection
-
-    @projection.setter
-    def projection(self, value):
-        self._projection = value
+        Raises:
+            ValueError: A field mapping conflicts with an Entity or a Feature.
+        """
+        assert name is not None
+        self.name = name
+        self.features = features or []
+        self.description = description
+        self.tags = tags or {}
+        self.owner = owner
+        self.projection = FeatureViewProjection.from_definition(self)
+        self.created_timestamp = None
+        self.last_updated_timestamp = None
 
     @property
     @abstractmethod
@@ -71,12 +99,7 @@ class BaseFeatureView(ABC):
 
     @abstractmethod
     def __copy__(self):
-        """
-        Generates a deep copy of this feature view
-
-        Returns:
-            A copy of this FeatureView
-        """
+        """Returns a deep copy of this base feature view."""
         pass
 
     def __repr__(self):
@@ -87,18 +110,20 @@ class BaseFeatureView(ABC):
         return str(MessageToJson(self.to_proto()))
 
     def __hash__(self):
-        return hash((id(self), self.name))
+        return hash(self.name)
 
     def __getitem__(self, item):
         assert isinstance(item, list)
 
-        referenced_features = []
-        for feature in self.features:
-            if feature.name in item:
-                referenced_features.append(feature)
-
         cp = self.__copy__()
-        cp.projection.features = referenced_features
+        if self.features:
+            referenced_features = []
+            for feature in self.features:
+                if feature.name in item:
+                    referenced_features.append(feature)
+            cp.projection.features = referenced_features
+        else:
+            cp.projection.desired_features = item
 
         return cp
 
@@ -108,10 +133,14 @@ class BaseFeatureView(ABC):
                 "Comparisons should only involve BaseFeatureView class objects."
             )
 
-        if self.name != other.name:
-            return False
-
-        if sorted(self.features) != sorted(other.features):
+        if (
+            self.name != other.name
+            or sorted(self.features) != sorted(other.features)
+            or self.projection != other.projection
+            or self.description != other.description
+            or self.tags != other.tags
+            or self.owner != other.owner
+        ):
             return False
 
         return True
@@ -128,15 +157,11 @@ class BaseFeatureView(ABC):
 
     def with_name(self, name: str):
         """
-        Renames this feature view by returning a copy of this feature view with an alias
-        set for the feature view name. This rename operation is only used as part of query
-        operations and will not modify the underlying FeatureView.
+        Returns a renamed copy of this base feature view. This renamed copy should only be
+        used for query operations and will not modify the underlying base feature view.
 
         Args:
-            name: Name to assign to the FeatureView copy.
-
-        Returns:
-            A copy of this FeatureView with the name replaced with the 'name' input.
+            name: The name to assign to the copy.
         """
         cp = self.__copy__()
         cp.projection.name_alias = name
@@ -145,15 +170,13 @@ class BaseFeatureView(ABC):
 
     def set_projection(self, feature_view_projection: FeatureViewProjection) -> None:
         """
-        Setter for the projection object held by this FeatureView. A projection is an
-        object that stores the modifications to a FeatureView that is applied to the FeatureView
-        when the FeatureView is used such as during feature_store.get_historical_features.
-        This method also performs checks to ensure the projection is consistent with this
-        FeatureView before doing the set.
+        Sets the feature view projection of this base feature view to the given projection.
 
         Args:
-            feature_view_projection: The FeatureViewProjection object to set this FeatureView's
-                'projection' field to.
+            feature_view_projection: The feature view projection to be set.
+
+        Raises:
+            ValueError: The name or features of the projection do not match.
         """
         if feature_view_projection.name != self.name:
             raise ValueError(
@@ -173,18 +196,14 @@ class BaseFeatureView(ABC):
 
     def with_projection(self, feature_view_projection: FeatureViewProjection):
         """
-        Sets the feature view projection by returning a copy of this on-demand feature view
-        with its projection set to the given projection. A projection is an
-        object that stores the modifications to a feature view that is used during
-        query operations.
+        Returns a copy of this base feature view with the feature view projection set to
+        the given projection.
 
         Args:
-            feature_view_projection: The FeatureViewProjection object to link to this
-                OnDemandFeatureView.
+            feature_view_projection: The feature view projection to assign to the copy.
 
-        Returns:
-            A copy of this OnDemandFeatureView with its projection replaced with the
-            'feature_view_projection' argument.
+        Raises:
+            ValueError: The name or features of the projection do not match.
         """
         if feature_view_projection.name != self.name:
             raise ValueError(

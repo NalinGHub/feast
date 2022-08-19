@@ -7,13 +7,16 @@ on:
 
 jobs:
   build-lambda-docker-image:
+    if: github.repository == 'feast-dev/feast'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v2
+        with:
+          install: true
       - name: Set up AWS SDK
         uses: aws-actions/configure-aws-credentials@v1
         with:
@@ -50,17 +53,20 @@ jobs:
           docker build \
             --file sdk/python/feast/infra/feature_servers/aws_lambda/Dockerfile \
             --tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.image-tag.outputs.DOCKER_IMAGE_TAG }} \
+            --load \
             .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.image-tag.outputs.DOCKER_IMAGE_TAG }}
     outputs:
       DOCKER_IMAGE_TAG: ${{ steps.image-tag.outputs.DOCKER_IMAGE_TAG }}
-  integration-test-python:
+  integration-test-python-and-go:
+    if: github.repository == 'feast-dev/feast'
     needs: build-lambda-docker-image
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ 3.7, 3.8, 3.9 ]
+        python-version: [ "3.8", "3.9", "3.10" ]
+        go-version: [ 1.17.0 ]
         os: [ ubuntu-latest ]
     env:
       OS: ${{ matrix.os }}
@@ -83,6 +89,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           architecture: x64
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ matrix.go-version }}
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v0
         with:
@@ -101,7 +112,7 @@ jobs:
         run: aws sts get-caller-identity
       - name: Upgrade pip version
         run: |
-          pip install --upgrade "pip>=21.3.1"
+          pip install --upgrade "pip>=21.3.1,<22.1"
       - name: Get pip cache dir
         id: pip-cache
         run: |
@@ -118,9 +129,25 @@ jobs:
             ${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-pip-
       - name: Install pip-tools
         run: pip install pip-tools
+      - name: Install apache-arrow on ubuntu
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+            sudo apt update
+            sudo apt install -y -V ca-certificates lsb-release wget
+            wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+            sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+            sudo apt update
+            sudo apt install -y -V libarrow-dev
+      - name: Install apache-arrow on macos
+        if: matrix.os == 'macOS-latest'
+        run: brew install apache-arrow
       - name: Install dependencies
         run: make install-python-ci-dependencies
-      - name: Test python
+      - name: Setup Redis Cluster
+        run: |
+          docker pull vishnunair/docker-redis-cluster:latest
+          docker run -d -p 6001:6379 -p 6002:6380 -p 6003:6381 -p 6004:6382 -p 6005:6383 -p 6006:6384 --name redis-cluster vishnunair/docker-redis-cluster
+      - name: Test python and go
         env:
           FEAST_SERVER_DOCKER_IMAGE_TAG: ${{ needs.build-lambda-docker-image.outputs.DOCKER_IMAGE_TAG }}
           FEAST_USAGE: "False"
@@ -130,7 +157,7 @@ jobs:
           SNOWFLAKE_CI_PASSWORD: ${{ secrets.SNOWFLAKE_CI_PASSWORD }}
           SNOWFLAKE_CI_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
           SNOWFLAKE_CI_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
-        run: pytest -n 8 --cov=./ --cov-report=xml --verbose --color=yes sdk/python/tests --integration --durations=5
+        run: pytest -n 8 --cov=./ --cov-report=xml --color=yes sdk/python/tests --integration --durations=5 --timeout=1200 --timeout_method=thread
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v1
         with:
@@ -145,11 +172,17 @@ jobs:
           FEAST_SERVER_DOCKER_IMAGE_TAG: ${{ needs.build-lambda-docker-image.outputs.DOCKER_IMAGE_TAG }}
           FEAST_USAGE: "False"
           IS_TEST: "True"
+          SNOWFLAKE_CI_DEPLOYMENT: ${{ secrets.SNOWFLAKE_CI_DEPLOYMENT }}
+          SNOWFLAKE_CI_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+          SNOWFLAKE_CI_PASSWORD: ${{ secrets.SNOWFLAKE_CI_PASSWORD }}
+          SNOWFLAKE_CI_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
+          SNOWFLAKE_CI_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
         run: pytest --verbose --color=yes sdk/python/tests --integration --benchmark --benchmark-autosave --benchmark-save-data --durations=5
       - name: Upload Benchmark Artifact to S3
         run: aws s3 cp --recursive .benchmarks s3://feast-ci-pytest-benchmarks
 
   build-all-docker-images:
+    if: github.repository == 'feast-dev/feast'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -162,14 +195,16 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v2
+        with:
+          install: true
       - name: Login to DockerHub
         uses: docker/login-action@v1
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@master
+        uses: google-github-actions/setup-gcloud@v0
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}

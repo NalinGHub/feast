@@ -71,11 +71,19 @@ class InfraDiff:
             TransitionType.UPDATE: ("Updated", Fore.YELLOW),
         }
         for infra_object_diff in self.infra_object_diffs:
+            if infra_object_diff.transition_type == TransitionType.UNCHANGED:
+                continue
             action, color = message_action_map[infra_object_diff.transition_type]
             log_string += f"{action} {infra_object_diff.infra_object_type} {Style.BRIGHT + color}{infra_object_diff.name}{Style.RESET_ALL}\n"
             if infra_object_diff.transition_type == TransitionType.UPDATE:
                 for _p in infra_object_diff.infra_object_property_diffs:
                     log_string += f"\t{_p.property_name}: {Style.BRIGHT + color}{_p.val_existing}{Style.RESET_ALL} -> {Style.BRIGHT + Fore.LIGHTGREEN_EX}{_p.val_declared}{Style.RESET_ALL}\n"
+
+        log_string = (
+            f"{Style.BRIGHT + Fore.LIGHTBLUE_EX}No changes to infrastructure"
+            if not log_string
+            else log_string
+        )
 
         return log_string
 
@@ -118,7 +126,8 @@ def diff_infra_protos(
             infra_objects_to_delete,
             infra_objects_to_add,
         ) = tag_infra_proto_objects_for_keep_delete_add(
-            current_infra_objects, new_infra_objects,
+            current_infra_objects,
+            new_infra_objects,
         )
 
         for e in infra_objects_to_add:
@@ -191,5 +200,10 @@ def diff_between(
                     )
                 )
     return InfraObjectDiff(
-        new.name, infra_object_type, current, new, property_diffs, transition,
+        new.name,
+        infra_object_type,
+        current,
+        new,
+        property_diffs,
+        transition,
     )

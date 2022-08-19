@@ -16,12 +16,11 @@
 
 ROOT_DIR 	:= $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 MVN := mvn -f java/pom.xml ${MAVEN_EXTRA_OPTS}
-PROTO_TYPE_SUBDIRS = core serving types storage
-PROTO_SERVICE_SUBDIRS = core serving
 OS := linux
 ifeq ($(shell uname -s), Darwin)
 	OS = osx
 endif
+TRINO_VERSION ?= 376
 
 # General
 
@@ -33,32 +32,29 @@ test: test-python test-java test-go
 
 protos: compile-protos-go compile-protos-python compile-protos-docs
 
-build: protos build-java build-docker build-html
-
-install-ci-dependencies: install-python-ci-dependencies install-java-ci-dependencies install-go-ci-dependencies
+build: protos build-java build-docker
 
 # Python SDK
 
-install-python-ci-dependencies:
-	cd sdk/python && python -m piptools sync requirements/py$(PYTHON)-ci-requirements.txt
-	cd sdk/python && python setup.py develop
+install-python-ci-dependencies: install-go-proto-dependencies install-go-ci-dependencies
+	python -m piptools sync sdk/python/requirements/py$(PYTHON)-ci-requirements.txt
+	COMPILE_GO=true python setup.py develop
 
 lock-python-ci-dependencies:
-	cd sdk/python && python -m piptools compile -U --extra ci --output-file requirements/py$(PYTHON)-ci-requirements.txt
+	python -m piptools compile -U --extra ci --output-file sdk/python/requirements/py$(PYTHON)-ci-requirements.txt
 
 package-protos:
 	cp -r ${ROOT_DIR}/protos ${ROOT_DIR}/sdk/python/feast/protos
 
 compile-protos-python:
-	@$(foreach dir,$(PROTO_TYPE_SUBDIRS),cd ${ROOT_DIR}/protos; python -m grpc_tools.protoc -I. --grpc_python_out=../sdk/python/feast/protos/ --python_out=../sdk/python/feast/protos/ --mypy_out=../sdk/python/feast/protos/ feast/$(dir)/*.proto;)
-	@$(foreach dir,$(PROTO_TYPE_SUBDIRS),grep -rli 'from feast.$(dir)' sdk/python/feast/protos | xargs -I@ sed -i.bak 's/from feast.$(dir)/from feast.protos.feast.$(dir)/g' @;)
+	python setup.py build_python_protos --inplace
 
 install-python:
-	cd sdk/python && python -m piptools sync requirements/py$(PYTHON)-requirements.txt
-	cd sdk/python && python setup.py develop
+	python -m piptools sync sdk/python/requirements/py$(PYTHON)-requirements.txt
+	python setup.py develop
 
 lock-python-dependencies:
-	cd sdk/python && python -m piptools compile -U --output-file requirements/py$(PYTHON)-requirements.txt
+	python -m piptools compile -U --output-file sdk/python/requirements/py$(PYTHON)-requirements.txt
 
 benchmark-python:
 	FEAST_USAGE=False IS_TEST=True python -m pytest --integration --benchmark  --benchmark-autosave --benchmark-save-data sdk/python/tests
@@ -67,16 +63,181 @@ benchmark-python-local:
 	FEAST_USAGE=False IS_TEST=True FEAST_IS_LOCAL_TEST=True python -m pytest --integration --benchmark  --benchmark-autosave --benchmark-save-data sdk/python/tests
 
 test-python:
-	FEAST_USAGE=False IS_TEST=True python -m pytest -n 8 sdk/python/tests
+	@(docker info > /dev/null 2>&1 && \
+		FEAST_USAGE=False \
+		IS_TEST=True \
+		python -m pytest -n 8 sdk/python/tests \
+	) || echo "This script uses Docker, and it isn't running - please start the Docker Daemon and try again!";
 
 test-python-integration:
 	FEAST_USAGE=False IS_TEST=True python -m pytest -n 8 --integration sdk/python/tests
 
-test-python-universal-local:
-	FEAST_USAGE=False IS_TEST=True FEAST_IS_LOCAL_TEST=True python -m pytest -n 8 --integration --universal sdk/python/tests
+test-python-integration-local:
+	@(docker info > /dev/null 2>&1 && \
+		FEAST_USAGE=False \
+		IS_TEST=True \
+		FEAST_IS_LOCAL_TEST=True \
+		FEAST_LOCAL_ONLINE_CONTAINER=True \
+		python -m pytest -n 8 --integration \
+			-k "not gcs_registry and \
+ 				not s3_registry and \
+ 				not test_lambda_materialization" \
+		sdk/python/tests \
+	) || echo "This script uses Docker, and it isn't running - please start the Docker Daemon and try again!";
+
+test-python-integration-container:
+	@(docker info > /dev/null 2>&1 && \
+		FEAST_USAGE=False \
+		IS_TEST=True \
+		FEAST_LOCAL_ONLINE_CONTAINER=True \
+		python -m pytest -n 8 --integration sdk/python/tests \
+	) || echo "This script uses Docker, and it isn't running - please start the Docker Daemon and try again!";
+
+test-python-universal-spark:
+	PYTHONPATH='.' \
+	FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.offline_stores.contrib.spark_repo_configuration \
+	PYTEST_PLUGINS=feast.infra.offline_stores.contrib.spark_offline_store.tests \
+ 	FEAST_USAGE=False IS_TEST=True \
+ 	python -m pytest -n 8 --integration \
+ 	 	-k "not test_historical_retrieval_fails_on_validation and \
+			not test_historical_retrieval_with_validation and \
+			not test_historical_features_persisting and \
+			not test_historical_retrieval_fails_on_validation and \
+			not test_universal_cli and \
+			not test_go_feature_server and \
+			not test_feature_logging and \
+			not test_reorder_columns and \
+			not test_logged_features_validation and \
+			not test_lambda_materialization_consistency and \
+			not test_offline_write and \
+			not test_push_features_to_offline_store.py and \
+			not gcs_registry and \
+			not s3_registry and \
+			not test_universal_types" \
+ 	 sdk/python/tests
+
+test-python-universal-trino:
+	PYTHONPATH='.' \
+	FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.offline_stores.contrib.trino_repo_configuration \
+	PYTEST_PLUGINS=feast.infra.offline_stores.contrib.trino_offline_store.tests \
+ 	FEAST_USAGE=False IS_TEST=True \
+ 	python -m pytest -n 8 --integration \
+ 	 	-k "not test_historical_retrieval_fails_on_validation and \
+			not test_historical_retrieval_with_validation and \
+			not test_historical_features_persisting and \
+			not test_historical_retrieval_fails_on_validation and \
+			not test_universal_cli and \
+			not test_go_feature_server and \
+			not test_feature_logging and \
+			not test_reorder_columns and \
+			not test_logged_features_validation and \
+			not test_lambda_materialization_consistency and \
+			not test_offline_write and \
+			not test_push_features_to_offline_store.py and \
+			not gcs_registry and \
+			not s3_registry and \
+			not test_universal_types" \
+ 	 sdk/python/tests
+
+#To use Athena as an offline store, you need to create an Athena database and an S3 bucket on AWS. https://docs.aws.amazon.com/athena/latest/ug/getting-started.html
+#Modify environment variables ATHENA_DATA_SOURCE, ATHENA_DATABASE, ATHENA_S3_BUCKET_NAME if you want to change the data source, database, and bucket name of S3 to use.
+#If tests fail with the pytest -n 8 option, change the number to 1.
+test-python-universal-athena:
+	PYTHONPATH='.' \
+	FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.offline_stores.contrib.athena_repo_configuration \
+	PYTEST_PLUGINS=feast.infra.offline_stores.contrib.athena_offline_store.tests \
+ 	FEAST_USAGE=False IS_TEST=True \
+	ATHENA_DATA_SOURCE=AwsDataCatalog \
+	ATHENA_DATABASE=default \
+	ATHENA_S3_BUCKET_NAME=feast-integration-tests \
+ 	python -m pytest -n 8 --integration \
+ 	 	-k "not test_go_feature_server and \
+		    not test_logged_features_validation and \
+		    not test_lambda and \
+		    not test_feature_logging and \
+		    not test_offline_write and \
+		    not test_push_offline and \
+		    not test_historical_retrieval_with_validation and \
+		    not test_historical_features_persisting and \
+		    not test_historical_retrieval_fails_on_validation and \
+			not gcs_registry and \
+			not s3_registry"  \
+	sdk/python/tests
+
+test-python-universal-postgres-offline:
+	PYTHONPATH='.' \
+		FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.offline_stores.contrib.postgres_repo_configuration \
+		PYTEST_PLUGINS=sdk.python.feast.infra.offline_stores.contrib.postgres_offline_store.tests \
+		FEAST_USAGE=False \
+		IS_TEST=True \
+		python -m pytest -n 8 --integration \
+ 			-k "not test_historical_retrieval_with_validation and \
+				not test_historical_features_persisting and \
+ 				not test_universal_cli and \
+ 				not test_go_feature_server and \
+ 				not test_feature_logging and \
+				not test_reorder_columns and \
+				not test_logged_features_validation and \
+				not test_lambda_materialization_consistency and \
+				not test_offline_write and \
+				not test_push_features_to_offline_store and \
+				not gcs_registry and \
+				not s3_registry and \
+ 				not test_universal_types" \
+ 			sdk/python/tests
+
+test-python-universal-postgres-online:
+	PYTHONPATH='.' \
+		FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.online_stores.contrib.postgres_repo_configuration \
+		PYTEST_PLUGINS=sdk.python.feast.infra.offline_stores.contrib.postgres_offline_store.tests \
+		FEAST_USAGE=False \
+		IS_TEST=True \
+		python -m pytest -n 8 --integration \
+ 			-k "not test_universal_cli and \
+ 				not test_go_feature_server and \
+ 				not test_feature_logging and \
+				not test_reorder_columns and \
+				not test_logged_features_validation and \
+				not test_lambda_materialization_consistency and \
+				not test_offline_write and \
+				not test_push_features_to_offline_store and \
+				not gcs_registry and \
+				not s3_registry and \
+ 				not test_universal_types" \
+ 			sdk/python/tests
+
+test-python-universal-cassandra:
+	PYTHONPATH='.' \
+	FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.online_stores.contrib.cassandra_repo_configuration \
+	PYTEST_PLUGINS=sdk.python.tests.integration.feature_repos.universal.online_store.cassandra \
+	FEAST_USAGE=False \
+	IS_TEST=True \
+	python -m pytest -x --integration \
+	sdk/python/tests
+
+test-python-universal-cassandra-no-cloud-providers:
+	PYTHONPATH='.' \
+	FULL_REPO_CONFIGS_MODULE=sdk.python.feast.infra.online_stores.contrib.cassandra_repo_configuration \
+	PYTEST_PLUGINS=sdk.python.tests.integration.feature_repos.universal.online_store.cassandra \
+	FEAST_USAGE=False \
+	IS_TEST=True \
+	python -m pytest -x --integration \
+	-k "not test_lambda_materialization_consistency   and \
+	  not test_apply_entity_integration               and \
+	  not test_apply_feature_view_integration         and \
+	  not test_apply_entity_integration               and \
+	  not test_apply_feature_view_integration         and \
+	  not test_apply_data_source_integration          and \
+	  not test_nullable_online_store				  and \
+	  not gcs_registry 								  and \
+	  not s3_registry" \
+	sdk/python/tests
 
 test-python-universal:
-	FEAST_USAGE=False IS_TEST=True python -m pytest -n 8 --integration --universal sdk/python/tests
+	FEAST_USAGE=False IS_TEST=True python -m pytest -n 8 --integration sdk/python/tests
+
+test-python-go-server: compile-go-lib
+	FEAST_USAGE=False IS_TEST=True pytest --integration --goserver sdk/python/tests
 
 format-python:
 	# Sort
@@ -86,7 +247,7 @@ format-python:
 	cd ${ROOT_DIR}/sdk/python; python -m black --target-version py37 feast tests
 
 lint-python:
-	cd ${ROOT_DIR}/sdk/python; python -m mypy feast/ tests/
+	cd ${ROOT_DIR}/sdk/python; python -m mypy
 	cd ${ROOT_DIR}/sdk/python; python -m isort feast/ tests/ --check-only
 	cd ${ROOT_DIR}/sdk/python; python -m flake8 feast/ tests/
 	cd ${ROOT_DIR}/sdk/python; python -m black --check feast tests
@@ -117,23 +278,55 @@ build-java:
 build-java-no-tests:
 	${MVN} --no-transfer-progress -Dmaven.javadoc.skip=true -Dgpg.skip -DskipUTs=true -DskipITs=true -Drevision=${REVISION} clean package
 
-# Go SDK
+# Trino plugin
+start-trino-locally:
+	cd ${ROOT_DIR}; docker run --detach --rm -p 8080:8080 --name trino -v ${ROOT_DIR}/sdk/python/feast/infra/offline_stores/contrib/trino_offline_store/test_config/properties/:/etc/catalog/:ro trinodb/trino:${TRINO_VERSION}
+	sleep 15
+
+test-trino-plugin-locally:
+	cd ${ROOT_DIR}/sdk/python; FULL_REPO_CONFIGS_MODULE=feast.infra.offline_stores.contrib.trino_offline_store.test_config.manual_tests FEAST_USAGE=False IS_TEST=True python -m pytest --integration tests/
+
+kill-trino-locally:
+	cd ${ROOT_DIR}; docker stop trino
+
+# Go SDK & embedded
+
+install-go-proto-dependencies:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.26.0
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
 
 install-go-ci-dependencies:
-	go get -u github.com/golang/protobuf/protoc-gen-go
-	go get -u golang.org/x/lint/golint
+	# TODO: currently gopy installation doesn't work w/o explicit go get in the next line
+	# TODO: there should be a better way to install gopy
+	go get github.com/go-python/gopy@v0.4.4
+	go install golang.org/x/tools/cmd/goimports
+	# The `go get` command on the previous lines download the lib along with replacing the dep to `feast-dev/gopy`
+	# but the following command is needed to install it for some reason.
+	go install github.com/go-python/gopy
+	python -m pip install pybindgen==0.22.0 protobuf==3.20.1
 
-compile-protos-go:
-	$(foreach dir,types serving core storage,cd ${ROOT_DIR}/protos; protoc -I/usr/local/include -I. --go_out=plugins=grpc,paths=source_relative:../sdk/go/protos feast/$(dir)/*.proto;)
+install-protoc-dependencies:
+	pip install --ignore-installed protobuf grpcio-tools==1.47.0 mypy-protobuf==3.1.0
 
-test-go:
-	cd ${ROOT_DIR}/sdk/go; go test ./...
+compile-protos-go: install-go-proto-dependencies install-protoc-dependencies
+	python setup.py build_go_protos
+
+compile-go-lib: install-go-proto-dependencies install-go-ci-dependencies
+	CGO_LDFLAGS_ALLOW=".*" COMPILE_GO=True python setup.py build_ext --inplace
+
+install-feast-ci-locally:
+	pip install -e ".[ci]"
+
+# Needs feast package to setup the feature store
+# CGO flag is due to this issue: https://github.com/golang/go/wiki/InvalidFlag
+test-go: compile-protos-go compile-protos-python  compile-go-lib install-feast-ci-locally
+	CGO_LDFLAGS_ALLOW=".*" go test -tags cgo,ccalloc ./...
 
 format-go:
-	cd ${ROOT_DIR}/sdk/go; gofmt -s -w *.go
+	gofmt -s -w go/
 
-lint-go:
-	cd ${ROOT_DIR}/sdk/go; go vet
+lint-go: compile-protos-go compile-go-lib
+	go vet -tags cgo,ccalloc ./go/internal/feast ./go/embedded
 
 # Docker
 
@@ -144,31 +337,40 @@ push-ci-docker:
 
 # TODO(adchia): consider removing. This doesn't run successfully right now
 build-ci-docker:
-	docker build -t $(REGISTRY)/feast-ci:$(VERSION) -f infra/docker/ci/Dockerfile .
+	docker buildx build -t $(REGISTRY)/feast-ci:$(VERSION) -f infra/docker/ci/Dockerfile --load .
 
 push-feature-server-python-aws-docker:
 		docker push $(REGISTRY)/feature-server-python-aws:$$VERSION
 
 build-feature-server-python-aws-docker:
-		docker build --build-arg VERSION=$$VERSION \
+		docker buildx build --build-arg VERSION=$$VERSION \
 			-t $(REGISTRY)/feature-server-python-aws:$$VERSION \
-			-f sdk/python/feast/infra/feature_servers/aws_lambda/Dockerfile .
+			-f sdk/python/feast/infra/feature_servers/aws_lambda/Dockerfile --load .
 
 push-feature-transformation-server-docker:
 	docker push $(REGISTRY)/feature-transformation-server:$(VERSION)
 
 build-feature-transformation-server-docker:
-	docker build --build-arg VERSION=$(VERSION) \
+	docker buildx build --build-arg VERSION=$(VERSION) \
 		-t $(REGISTRY)/feature-transformation-server:$(VERSION) \
-		-f sdk/python/feast/infra/transformation_servers/Dockerfile .
+		-f sdk/python/feast/infra/transformation_servers/Dockerfile --load .
 
 push-feature-server-java-docker:
 	docker push $(REGISTRY)/feature-server-java:$(VERSION)
 
 build-feature-server-java-docker:
-	docker build --build-arg VERSION=$(VERSION) \
+	docker buildx build --build-arg VERSION=$(VERSION) \
 		-t $(REGISTRY)/feature-server-java:$(VERSION) \
-		-f java/infra/docker/feature-server/Dockerfile .
+		-f java/infra/docker/feature-server/Dockerfile --load .
+
+build-java-docker-dev:
+	make build-java-no-tests REVISION=dev
+	docker buildx build --build-arg VERSION=dev \
+		-t feastdev/feature-transformation-server:dev \
+		-f sdk/python/feast/infra/transformation_servers/Dockerfile --load .
+	docker buildx build --build-arg VERSION=dev \
+		-t feastdev/feature-server-java:dev \
+		-f java/infra/docker/feature-server/Dockerfile.dev --load .
 
 # Documentation
 
@@ -199,3 +401,9 @@ build-sphinx: compile-protos-python
 
 build-templates:
 	python infra/scripts/compile-templates.py
+
+# Web UI
+
+# Note: requires node and yarn to be installed
+build-ui:
+	cd $(ROOT_DIR)/sdk/python/feast/ui && yarn install && npm run build --omit=dev

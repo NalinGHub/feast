@@ -29,17 +29,19 @@ from pathlib import Path
 
 import requests
 
-from feast.constants import FEAST_USAGE
+from feast import flags_helper
+from feast.constants import DEFAULT_FEAST_USAGE_VALUE, FEAST_USAGE
 from feast.version import get_version
 
 USAGE_ENDPOINT = "https://usage.feast.dev"
 
 _logger = logging.getLogger(__name__)
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
-_is_enabled = os.getenv(FEAST_USAGE, default="True") == "True"
+_is_enabled = os.getenv(FEAST_USAGE, default=DEFAULT_FEAST_USAGE_VALUE) == "True"
 
 _constant_attributes = {
+    "project_id": "",
     "session_id": str(uuid.uuid4()),
     "installation_id": None,
     "version": get_version(),
@@ -51,6 +53,17 @@ _constant_attributes = {
         ).encode()
     ).hexdigest(),
 }
+
+APPLICATION_NAME = "feast-dev/feast"
+USER_AGENT = "{}/{}".format(APPLICATION_NAME, get_version())
+
+
+def get_user_agent():
+    return USER_AGENT
+
+
+def set_current_project_uuid(project_uuid: str):
+    _constant_attributes["project_id"] = project_uuid
 
 
 @dataclasses.dataclass
@@ -167,7 +180,8 @@ def _export(event: typing.Dict[str, typing.Any]):
 
 
 def _produce_event(ctx: UsageContext):
-    is_test = bool({"pytest", "unittest"} & sys.modules.keys())
+    # Cannot check for unittest because typeguard pulls in unittest
+    is_test = flags_helper.is_test() or bool({"pytest"} & sys.modules.keys())
     event = {
         "timestamp": datetime.utcnow().isoformat(),
         "is_test": is_test,
@@ -224,27 +238,27 @@ def tracing_span(name):
 
 def log_exceptions_and_usage(*args, **attrs):
     """
-        This function decorator enables three components:
-        1. Error tracking
-        2. Usage statistic collection
-        3. Time profiling
+    This function decorator enables three components:
+    1. Error tracking
+    2. Usage statistic collection
+    3. Time profiling
 
-        This data is being collected, anonymized and sent to Feast Developers.
-        All events from nested decorated functions are being grouped into single event
-        to build comprehensive context useful for profiling and error tracking.
+    This data is being collected, anonymized and sent to Feast Developers.
+    All events from nested decorated functions are being grouped into single event
+    to build comprehensive context useful for profiling and error tracking.
 
-        Usage example (will result in one output event):
-            @log_exceptions_and_usage
-            def fn(...):
-                nested()
+    Usage example (will result in one output event):
+        @log_exceptions_and_usage
+        def fn(...):
+            nested()
 
-            @log_exceptions_and_usage(attr='value')
-            def nested(...):
-                deeply_nested()
+        @log_exceptions_and_usage(attr='value')
+        def nested(...):
+            deeply_nested()
 
-            @log_exceptions_and_usage(attr2='value2', sample=RateSampler(rate=0.1))
-            def deeply_nested(...):
-                ...
+        @log_exceptions_and_usage(attr2='value2', sample=RateSampler(rate=0.1))
+        def deeply_nested(...):
+            ...
     """
     sampler = attrs.pop("sampler", AlwaysSampler())
 

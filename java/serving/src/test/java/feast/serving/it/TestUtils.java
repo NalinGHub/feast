@@ -22,7 +22,7 @@ import feast.proto.serving.ServingAPIProto;
 import feast.proto.serving.ServingAPIProto.GetOnlineFeaturesRequest;
 import feast.proto.serving.ServingServiceGrpc;
 import feast.proto.types.ValueProto;
-import feast.serving.config.ApplicationProperties;
+import feast.serving.service.config.ApplicationProperties;
 import io.grpc.Channel;
 import io.grpc.ManagedChannelBuilder;
 import java.util.*;
@@ -77,13 +77,14 @@ public class TestUtils {
 
     feastProperties.setActiveStore("online");
     feastProperties.setProject("feast_project");
-
+    feastProperties.setEntityKeySerializationVersion(2);
     feastProperties.setStores(
         ImmutableList.of(
             new ApplicationProperties.Store(
                 "online",
                 "REDIS",
-                ImmutableMap.of("host", redisHost, "port", redisPort.toString()))));
+                ImmutableMap.of(
+                    "host", redisHost, "port", redisPort.toString(), "password", "testpw"))));
 
     return feastProperties;
   }

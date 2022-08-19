@@ -1,12 +1,28 @@
-from typing import List, Set
+from typing import Any, List, Set
 
 from colorama import Fore, Style
+
+from feast.field import Field
 
 
 class DataSourceNotFoundException(Exception):
     def __init__(self, path):
         super().__init__(
             f"Unable to find table at '{path}'. Please check that table exists."
+        )
+
+
+class DataSourceNoNameException(Exception):
+    def __init__(self):
+        super().__init__(
+            "Unable to infer a name for this data source. Either table or name must be specified."
+        )
+
+
+class DataSourceRepeatNamesException(Exception):
+    def __init__(self, ds_name: str):
+        super().__init__(
+            f"Multiple data sources share the same case-insensitive name {ds_name}."
         )
 
 
@@ -64,6 +80,14 @@ class RequestDataNotFoundInEntityRowsException(FeastObjectNotFoundException):
         )
 
 
+class DataSourceObjectNotFoundException(FeastObjectNotFoundException):
+    def __init__(self, name, project=None):
+        if project:
+            super().__init__(f"Data source {name} does not exist in project {project}")
+        else:
+            super().__init__(f"Data source {name} does not exist")
+
+
 class S3RegistryBucketNotExist(FeastObjectNotFoundException):
     def __init__(self, bucket):
         super().__init__(f"S3 bucket {bucket} for the Feast registry does not exist")
@@ -77,6 +101,13 @@ class S3RegistryBucketForbiddenAccess(FeastObjectNotFoundException):
 class SavedDatasetNotFound(FeastObjectNotFoundException):
     def __init__(self, name: str, project: str):
         super().__init__(f"Saved dataset {name} does not exist in project {project}")
+
+
+class ValidationReferenceNotFound(FeastObjectNotFoundException):
+    def __init__(self, name: str, project: str):
+        super().__init__(
+            f"Validation reference {name} does not exist in project {project}"
+        )
 
 
 class FeastProviderLoginError(Exception):
@@ -161,10 +192,27 @@ class FeatureNameCollisionError(Exception):
 
 
 class SpecifiedFeaturesNotPresentError(Exception):
-    def __init__(self, specified_features: List[str], feature_view_name: str):
-        features = ", ".join(specified_features)
+    def __init__(
+        self,
+        specified_features: List[Field],
+        inferred_features: List[Field],
+        feature_view_name: str,
+    ):
         super().__init__(
-            f"Explicitly specified features {features} not found in inferred list of features for '{feature_view_name}'"
+            f"Explicitly specified features {specified_features} not found in inferred list of features "
+            f"{inferred_features} for '{feature_view_name}'"
+        )
+
+
+class SavedDatasetLocationAlreadyExists(Exception):
+    def __init__(self, location: str):
+        super().__init__(f"Saved dataset location {location} already exists.")
+
+
+class FeastOfflineStoreInvalidName(Exception):
+    def __init__(self, offline_store_class_name: str):
+        super().__init__(
+            f"Offline Store Class '{offline_store_class_name}' should end with the string `OfflineStore`.'"
         )
 
 
@@ -250,6 +298,16 @@ class RedshiftTableNameTooLong(Exception):
         )
 
 
+class SnowflakeCredentialsError(Exception):
+    def __init__(self):
+        super().__init__("Snowflake Connector failed due to incorrect credentials")
+
+
+class SnowflakeQueryError(Exception):
+    def __init__(self, details):
+        super().__init__(f"Snowflake SQL Query failed to finish. Details: {details}")
+
+
 class EntityTimestampInferenceException(Exception):
     def __init__(self, expected_column_name: str):
         super().__init__(
@@ -270,14 +328,6 @@ class ConflictingFeatureViewNames(Exception):
     def __init__(self, feature_view_name: str):
         super().__init__(
             f"The feature view name: {feature_view_name} refers to feature views of different types."
-        )
-
-
-class ExperimentalFeatureNotEnabled(Exception):
-    def __init__(self, feature_flag_name: str):
-        super().__init__(
-            f"You are attempting to use an experimental feature that is not enabled. Please run "
-            f"`feast alpha enable {feature_flag_name}` "
         )
 
 
@@ -310,3 +360,20 @@ class IncompatibleRegistryStoreClass(Exception):
 class FeastInvalidInfraObjectType(Exception):
     def __init__(self):
         super().__init__("Could not identify the type of the InfraObject.")
+
+
+class SnowflakeIncompleteConfig(Exception):
+    def __init__(self, e: KeyError):
+        super().__init__(f"{e} not defined in a config file or feature_store.yaml file")
+
+
+class SnowflakeQueryUnknownError(Exception):
+    def __init__(self, query: str):
+        super().__init__(f"Snowflake query failed: {query}")
+
+
+class InvalidFeaturesParameterType(Exception):
+    def __init__(self, features: Any):
+        super().__init__(
+            f"Invalid `features` parameter type {type(features)}. Expected one of List[str] and FeatureService."
+        )

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +21,10 @@ import click
 import pkg_resources
 import yaml
 from colorama import Fore, Style
+from dateutil import parser
+from pygments import formatters, highlight, lexers
 
-from feast import flags, flags_helper, utils
+from feast import utils
 from feast.constants import DEFAULT_FEATURE_TRANSFORMATION_SERVER_PORT
 from feast.errors import FeastObjectNotFoundException, FeastProviderLoginError
 from feast.feature_store import FeatureStore
@@ -38,9 +40,10 @@ from feast.repo_operations import (
     registry_dump,
     teardown,
 )
+from feast.repo_upgrade import RepoUpgrader
+from feast.utils import maybe_local_tz
 
 _logger = logging.getLogger(__name__)
-DATETIME_ISO = "%Y-%m-%dT%H:%M:%s"
 
 
 class NoOptionDefaultFormat(click.Command):
@@ -67,8 +70,17 @@ class NoOptionDefaultFormat(click.Command):
     default="info",
     help="The logging level. One of DEBUG, INFO, WARNING, ERROR, and CRITICAL (case-insensitive).",
 )
+@click.option(
+    "--feature-store-yaml",
+    help="Override the directory where the CLI should look for the feature_store.yaml file.",
+)
 @click.pass_context
-def cli(ctx: click.Context, chdir: Optional[str], log_level: str):
+def cli(
+    ctx: click.Context,
+    chdir: Optional[str],
+    log_level: str,
+    feature_store_yaml: Optional[str],
+):
     """
     Feast CLI
 
@@ -78,10 +90,15 @@ def cli(ctx: click.Context, chdir: Optional[str], log_level: str):
     """
     ctx.ensure_object(dict)
     ctx.obj["CHDIR"] = Path.cwd() if chdir is None else Path(chdir).absolute()
+    ctx.obj["FS_YAML_FILE"] = (
+        Path(feature_store_yaml).absolute()
+        if feature_store_yaml
+        else ctx.obj["CHDIR"] / "feature_store.yaml"
+    )
     try:
         level = getattr(logging, log_level.upper())
         logging.basicConfig(
-            format="%(asctime)s %(levelname)s:%(message)s",
+            format="%(asctime)s %(name)s %(levelname)s: %(message)s",
             datefmt="%m/%d/%Y %I:%M:%S %p",
             level=level,
         )
@@ -94,7 +111,6 @@ def cli(ctx: click.Context, chdir: Optional[str], log_level: str):
             if "feast" in logger_name:
                 logger = logging.getLogger(logger_name)
                 logger.setLevel(level)
-
     except Exception as e:
         raise e
     pass
@@ -109,14 +125,58 @@ def version():
 
 
 @cli.command()
+@click.option(
+    "--host",
+    "-h",
+    type=click.STRING,
+    default="0.0.0.0",
+    show_default=True,
+    help="Specify a host for the server",
+)
+@click.option(
+    "--port",
+    "-p",
+    type=click.INT,
+    default=8888,
+    show_default=True,
+    help="Specify a port for the server",
+)
+@click.option(
+    "--registry_ttl_sec",
+    "-r",
+    help="Number of seconds after which the registry is refreshed",
+    type=int,
+    default=5,
+    show_default=True,
+)
+@click.pass_context
+def ui(ctx: click.Context, host: str, port: int, registry_ttl_sec: int):
+    """
+    Shows the Feast UI over the current directory
+    """
+    repo = ctx.obj["CHDIR"]
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
+    # Pass in the registry_dump method to get around a circular dependency
+    store.serve_ui(
+        host=host,
+        port=port,
+        get_registry_dump=registry_dump,
+        registry_ttl_sec=registry_ttl_sec,
+    )
+
+
+@cli.command()
 @click.pass_context
 def endpoint(ctx: click.Context):
     """
-    Display feature server endpoints.
+    Display feature server endpoints
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     endpoint = store.get_feature_server_endpoint()
     if endpoint is not None:
         _logger.info(
@@ -124,6 +184,58 @@ def endpoint(ctx: click.Context):
         )
     else:
         _logger.info("There is no active feature server.")
+
+
+@cli.group(name="data-sources")
+def data_sources_cmd():
+    """
+    Access data sources
+    """
+    pass
+
+
+@data_sources_cmd.command("describe")
+@click.argument("name", type=click.STRING)
+@click.pass_context
+def data_source_describe(ctx: click.Context, name: str):
+    """
+    Describe a data source
+    """
+    repo = ctx.obj["CHDIR"]
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
+
+    try:
+        data_source = store.get_data_source(name)
+    except FeastObjectNotFoundException as e:
+        print(e)
+        exit(1)
+
+    print(
+        yaml.dump(
+            yaml.safe_load(str(data_source)), default_flow_style=False, sort_keys=False
+        )
+    )
+
+
+@data_sources_cmd.command(name="list")
+@click.pass_context
+def data_source_list(ctx: click.Context):
+    """
+    List all data sources
+    """
+    repo = ctx.obj["CHDIR"]
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
+    table = []
+    for datasource in store.list_data_sources():
+        table.append([datasource.name, datasource.__class__])
+
+    from tabulate import tabulate
+
+    print(tabulate(table, headers=["NAME", "CLASS"], tablefmt="plain"))
 
 
 @cli.group(name="entities")
@@ -142,8 +254,9 @@ def entity_describe(ctx: click.Context, name: str):
     Describe an entity
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
     try:
         entity = store.get_entity(name)
@@ -165,8 +278,9 @@ def entity_list(ctx: click.Context):
     List all entities
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     table = []
     for entity in store.list_entities():
         table.append([entity.name, entity.description, entity.value_type])
@@ -192,8 +306,9 @@ def feature_service_describe(ctx: click.Context, name: str):
     Describe a feature service
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
     try:
         feature_service = store.get_feature_service(name)
@@ -217,8 +332,9 @@ def feature_service_list(ctx: click.Context):
     List all feature services
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     feature_services = []
     for feature_service in store.list_feature_services():
         feature_names = []
@@ -249,8 +365,9 @@ def feature_view_describe(ctx: click.Context, name: str):
     Describe a feature view
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
     try:
         feature_view = store.get_feature_view(name)
@@ -272,8 +389,10 @@ def feature_view_list(ctx: click.Context):
     List all feature views
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     table = []
     for feature_view in [
         *store.list_feature_views(),
@@ -284,7 +403,7 @@ def feature_view_list(ctx: click.Context):
         if isinstance(feature_view, FeatureView):
             entities.update(feature_view.entities)
         elif isinstance(feature_view, OnDemandFeatureView):
-            for backing_fv in feature_view.input_feature_view_projections.values():
+            for backing_fv in feature_view.source_feature_view_projections.values():
                 entities.update(store.get_feature_view(backing_fv.name).entities)
         table.append(
             [
@@ -315,8 +434,9 @@ def on_demand_feature_view_describe(ctx: click.Context, name: str):
     [Experimental] Describe an on demand feature view
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
     try:
         on_demand_feature_view = store.get_on_demand_feature_view(name)
@@ -340,8 +460,9 @@ def on_demand_feature_view_list(ctx: click.Context):
     [Experimental] List all on demand feature views
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     table = []
     for on_demand_feature_view in store.list_on_demand_feature_views():
         table.append([on_demand_feature_view.name])
@@ -363,8 +484,9 @@ def plan_command(ctx: click.Context, skip_source_validation: bool):
     Create or update a feature store deployment
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_config = load_repo_config(repo)
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    repo_config = load_repo_config(repo, fs_yaml_file)
     try:
         plan(repo_config, repo, skip_source_validation)
     except FeastProviderLoginError as e:
@@ -383,8 +505,10 @@ def apply_total_command(ctx: click.Context, skip_source_validation: bool):
     Create or update a feature store deployment
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_config = load_repo_config(repo)
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+
+    repo_config = load_repo_config(repo, fs_yaml_file)
     try:
         apply_total(repo_config, repo, skip_source_validation)
     except FeastProviderLoginError as e:
@@ -398,8 +522,9 @@ def teardown_command(ctx: click.Context):
     Tear down deployed feature store infrastructure
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_config = load_repo_config(repo)
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    repo_config = load_repo_config(repo, fs_yaml_file)
 
     teardown(repo_config, repo)
 
@@ -411,17 +536,21 @@ def registry_dump_command(ctx: click.Context):
     Print contents of the metadata registry
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_config = load_repo_config(repo)
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    repo_config = load_repo_config(repo, fs_yaml_file)
 
-    registry_dump(repo_config, repo_path=repo)
+    click.echo(registry_dump(repo_config, repo_path=repo))
 
 
 @cli.command("materialize")
 @click.argument("start_ts")
 @click.argument("end_ts")
 @click.option(
-    "--views", "-v", help="Feature views to materialize", multiple=True,
+    "--views",
+    "-v",
+    help="Feature views to materialize",
+    multiple=True,
 )
 @click.pass_context
 def materialize_command(
@@ -436,19 +565,23 @@ def materialize_command(
     START_TS and END_TS should be in ISO 8601 format, e.g. '2021-07-16T19:20:01'
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     store.materialize(
         feature_views=None if not views else views,
-        start_date=utils.make_tzaware(datetime.fromisoformat(start_ts)),
-        end_date=utils.make_tzaware(datetime.fromisoformat(end_ts)),
+        start_date=utils.make_tzaware(parser.parse(start_ts)),
+        end_date=utils.make_tzaware(parser.parse(end_ts)),
     )
 
 
 @cli.command("materialize-incremental")
 @click.argument("end_ts")
 @click.option(
-    "--views", "-v", help="Feature views to incrementally materialize", multiple=True,
+    "--views",
+    "-v",
+    help="Feature views to incrementally materialize",
+    multiple=True,
 )
 @click.pass_context
 def materialize_incremental_command(ctx: click.Context, end_ts: str, views: List[str]):
@@ -461,8 +594,9 @@ def materialize_incremental_command(ctx: click.Context, end_ts: str, views: List
     END_TS should be in ISO 8601 format, e.g. '2021-07-16T19:20:01'
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
     store.materialize_incremental(
         feature_views=None if not views else views,
         end_date=utils.make_tzaware(datetime.fromisoformat(end_ts)),
@@ -477,7 +611,10 @@ def materialize_incremental_command(ctx: click.Context, end_ts: str, views: List
 @click.option(
     "--template",
     "-t",
-    type=click.Choice(["local", "gcp", "aws"], case_sensitive=False),
+    type=click.Choice(
+        ["local", "gcp", "aws", "snowflake", "spark", "postgres", "hbase", "cassandra"],
+        case_sensitive=False,
+    ),
     help="Specify a template for the created project",
     default="local",
 )
@@ -498,26 +635,65 @@ def init_command(project_directory, minimal: bool, template: str):
     "-h",
     type=click.STRING,
     default="127.0.0.1",
-    help="Specify a host for the server [default: 127.0.0.1]",
+    show_default=True,
+    help="Specify a host for the server",
 )
 @click.option(
     "--port",
     "-p",
     type=click.INT,
     default=6566,
-    help="Specify a port for the server [default: 6566]",
+    show_default=True,
+    help="Specify a port for the server",
 )
 @click.option(
-    "--no-access-log", is_flag=True, help="Disable the Uvicorn access log.",
+    "--type",
+    "-t",
+    "type_",
+    type=click.STRING,
+    default="http",
+    show_default=True,
+    help="Specify a server type: 'http' or 'grpc'",
+)
+@click.option(
+    "--go",
+    is_flag=True,
+    show_default=True,
+    help="Use Go to serve",
+)
+@click.option(
+    "--no-access-log",
+    is_flag=True,
+    show_default=True,
+    help="Disable the Uvicorn access log",
+)
+@click.option(
+    "--no-feature-log",
+    is_flag=True,
+    show_default=True,
+    help="Disable logging served features",
 )
 @click.pass_context
-def serve_command(ctx: click.Context, host: str, port: int, no_access_log: bool):
-    """[Experimental] Start a the feature consumption server locally on a given port."""
+def serve_command(
+    ctx: click.Context,
+    host: str,
+    port: int,
+    type_: str,
+    go: bool,
+    no_access_log: bool,
+    no_feature_log: bool,
+):
+    """Start a feature server locally on a given port."""
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
-    store.serve(host, port, no_access_log)
+    if go:
+        # Turn on Go feature retrieval.
+        store.config.go_feature_serving = True
+
+    store.serve(host, port, type_, no_access_log, no_feature_log)
 
 
 @cli.command("serve_transformations")
@@ -530,119 +706,97 @@ def serve_command(ctx: click.Context, host: str, port: int, no_access_log: bool)
 )
 @click.pass_context
 def serve_transformations_command(ctx: click.Context, port: int):
-    """[Experimental] Start a the feature consumption server locally on a given port."""
+    """[Experimental] Start a feature consumption server locally on a given port."""
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    store = FeatureStore(repo_path=str(repo))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
     store.serve_transformations(port)
 
 
-@cli.group(name="alpha")
-def alpha_cmd():
-    """
-    Access alpha features
-    """
-    pass
-
-
-@alpha_cmd.command("list")
+@cli.command("validate")
+@click.option(
+    "--feature-service",
+    "-f",
+    help="Specify a feature service name",
+)
+@click.option(
+    "--reference",
+    "-r",
+    help="Specify a validation reference name",
+)
+@click.option(
+    "--no-profile-cache",
+    is_flag=True,
+    help="Do not store cached profile in registry",
+)
+@click.argument("start_ts")
+@click.argument("end_ts")
 @click.pass_context
-def list_alpha_features(ctx: click.Context):
+def validate(
+    ctx: click.Context,
+    feature_service: str,
+    reference: str,
+    start_ts: str,
+    end_ts: str,
+    no_profile_cache,
+):
     """
-    Lists all alpha features
+    Perform validation of logged features (produced by a given feature service) against provided reference.
+
+    START_TS and END_TS should be in ISO 8601 format, e.g. '2021-07-16T19:20:01'
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_path = str(repo)
-    store = FeatureStore(repo_path=repo_path)
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    store = FeatureStore(repo_path=str(repo), fs_yaml_file=fs_yaml_file)
 
-    flags_to_show = flags.FLAG_NAMES.copy()
-    flags_to_show.remove(flags.FLAG_ALPHA_FEATURES_NAME)
-    print("Alpha features:")
-    for flag in flags_to_show:
-        enabled_string = (
-            "enabled"
-            if flags_helper.feature_flag_enabled(store.config, flag)
-            else "disabled"
-        )
-        print(f"{flag}: {enabled_string}")
+    feature_service = store.get_feature_service(name=feature_service)
+    reference = store.get_validation_reference(reference)
 
+    result = store.validate_logged_features(
+        source=feature_service,
+        reference=reference,
+        start=maybe_local_tz(datetime.fromisoformat(start_ts)),
+        end=maybe_local_tz(datetime.fromisoformat(end_ts)),
+        throw_exception=False,
+        cache_profile=not no_profile_cache,
+    )
 
-@alpha_cmd.command("enable-all")
-@click.pass_context
-def enable_alpha_features(ctx: click.Context):
-    """
-    Enables all alpha features
-    """
-    repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_path = str(repo)
-    store = FeatureStore(repo_path=repo_path)
-
-    if store.config.flags is None:
-        store.config.flags = {}
-    for flag_name in flags.FLAG_NAMES:
-        store.config.flags[flag_name] = True
-    store.config.write_to_path(Path(repo_path))
-
-
-@alpha_cmd.command("enable")
-@click.argument("name", type=click.STRING)
-@click.pass_context
-def enable_alpha_feature(ctx: click.Context, name: str):
-    """
-    Enables an alpha feature
-    """
-    if name not in flags.FLAG_NAMES:
-        raise ValueError(f"Flag name, {name}, not valid.")
-
-    repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_path = str(repo)
-    store = FeatureStore(repo_path=repo_path)
-
-    if store.config.flags is None:
-        store.config.flags = {}
-    store.config.flags[flags.FLAG_ALPHA_FEATURES_NAME] = True
-    store.config.flags[name] = True
-    store.config.write_to_path(Path(repo_path))
-
-
-@alpha_cmd.command("disable")
-@click.argument("name", type=click.STRING)
-@click.pass_context
-def disable_alpha_feature(ctx: click.Context, name: str):
-    """
-    Disables an alpha feature
-    """
-    if name not in flags.FLAG_NAMES:
-        raise ValueError(f"Flag name, {name}, not valid.")
-
-    repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_path = str(repo)
-    store = FeatureStore(repo_path=repo_path)
-
-    if store.config.flags is None or name not in store.config.flags:
+    if not result:
+        print(f"{Style.BRIGHT + Fore.GREEN}Validation successful!{Style.RESET_ALL}")
         return
-    store.config.flags[name] = False
-    store.config.write_to_path(Path(repo_path))
+
+    errors = [e.to_dict() for e in result.report.errors]
+    formatted_json = json.dumps(errors, indent=4)
+    colorful_json = highlight(
+        formatted_json, lexers.JsonLexer(), formatters.TerminalFormatter()
+    )
+    print(f"{Style.BRIGHT + Fore.RED}Validation failed!{Style.RESET_ALL}")
+    print(colorful_json)
+    exit(1)
 
 
-@alpha_cmd.command("disable-all")
+@cli.command("repo-upgrade", cls=NoOptionDefaultFormat)
+@click.option(
+    "--write",
+    is_flag=True,
+    default=False,
+    help="Upgrade a feature repo to use the API expected by feast 0.23.",
+)
 @click.pass_context
-def disable_alpha_features(ctx: click.Context):
+def repo_upgrade(ctx: click.Context, write: bool):
     """
-    Disables all alpha features
+    Upgrade a feature repo in place.
     """
     repo = ctx.obj["CHDIR"]
-    cli_check_repo(repo)
-    repo_path = str(repo)
-    store = FeatureStore(repo_path=repo_path)
-
-    store.config.flags = None
-    store.config.write_to_path(Path(repo_path))
+    fs_yaml_file = ctx.obj["FS_YAML_FILE"]
+    cli_check_repo(repo, fs_yaml_file)
+    try:
+        RepoUpgrader(repo, write).upgrade()
+    except FeastProviderLoginError as e:
+        print(str(e))
 
 
 if __name__ == "__main__":

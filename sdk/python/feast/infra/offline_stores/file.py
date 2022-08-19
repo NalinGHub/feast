@@ -1,16 +1,29 @@
+import os
+import uuid
 from datetime import datetime
-from typing import Callable, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Tuple, Union
 
+import dask.dataframe as dd
 import pandas as pd
 import pyarrow
+import pyarrow.dataset
+import pyarrow.parquet
 import pytz
 from pydantic.typing import Literal
 
-from feast import FileSource, OnDemandFeatureView
 from feast.data_source import DataSource
-from feast.errors import FeastJoinKeysDuringMaterialization
+from feast.errors import (
+    FeastJoinKeysDuringMaterialization,
+    SavedDatasetLocationAlreadyExists,
+)
+from feast.feature_logging import LoggingConfig, LoggingSource
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL, FeatureView
-from feast.infra.offline_stores.file_source import SavedDatasetFileStorage
+from feast.infra.offline_stores.file_source import (
+    FileLoggingDestination,
+    FileSource,
+    SavedDatasetFileStorage,
+)
 from feast.infra.offline_stores.offline_store import (
     OfflineStore,
     RetrievalJob,
@@ -18,19 +31,21 @@ from feast.infra.offline_stores.offline_store import (
 )
 from feast.infra.offline_stores.offline_utils import (
     DEFAULT_ENTITY_DF_EVENT_TIMESTAMP_COL,
+    get_pyarrow_schema_from_batch_source,
 )
-from feast.infra.provider import (
-    _get_requested_feature_views_to_features_dict,
-    _run_field_mapping,
-)
-from feast.registry import Registry
+from feast.infra.registry.base_registry import BaseRegistry
+from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.repo_config import FeastConfigBaseModel, RepoConfig
 from feast.saved_dataset import SavedDatasetStorage
 from feast.usage import log_exceptions_and_usage
+from feast.utils import (
+    _get_requested_feature_views_to_features_dict,
+    _run_dask_field_mapping,
+)
 
 
 class FileOfflineStoreConfig(FeastConfigBaseModel):
-    """ Offline store config for local (file-based) store """
+    """Offline store config for local (file-based) store"""
 
     type: Literal["file"] = "file"
     """ Offline store type selector"""
@@ -49,9 +64,7 @@ class FileRetrievalJob(RetrievalJob):
         # The evaluation function executes a stored procedure to compute a historical retrieval.
         self.evaluation_function = evaluation_function
         self._full_feature_names = full_feature_names
-        self._on_demand_feature_views = (
-            on_demand_feature_views if on_demand_feature_views else []
-        )
+        self._on_demand_feature_views = on_demand_feature_views or []
         self._metadata = metadata
 
     @property
@@ -59,41 +72,50 @@ class FileRetrievalJob(RetrievalJob):
         return self._full_feature_names
 
     @property
-    def on_demand_feature_views(self) -> Optional[List[OnDemandFeatureView]]:
+    def on_demand_feature_views(self) -> List[OnDemandFeatureView]:
         return self._on_demand_feature_views
 
     @log_exceptions_and_usage
     def _to_df_internal(self) -> pd.DataFrame:
         # Only execute the evaluation function to build the final historical retrieval dataframe at the last moment.
-        df = self.evaluation_function()
+        df = self.evaluation_function().compute()
+        df = df.reset_index(drop=True)
         return df
 
     @log_exceptions_and_usage
     def _to_arrow_internal(self):
         # Only execute the evaluation function to build the final historical retrieval dataframe at the last moment.
-        df = self.evaluation_function()
+        df = self.evaluation_function().compute()
         return pyarrow.Table.from_pandas(df)
 
-    def persist(self, storage: SavedDatasetStorage):
+    def persist(self, storage: SavedDatasetStorage, allow_overwrite: bool = False):
         assert isinstance(storage, SavedDatasetFileStorage)
 
+        # Check if the specified location already exists.
+        if not allow_overwrite and os.path.exists(storage.file_options.uri):
+            raise SavedDatasetLocationAlreadyExists(location=storage.file_options.uri)
+
         filesystem, path = FileSource.create_filesystem_and_path(
-            storage.file_options.file_url, storage.file_options.s3_endpoint_override,
+            storage.file_options.uri,
+            storage.file_options.s3_endpoint_override,
         )
 
         if path.endswith(".parquet"):
             pyarrow.parquet.write_table(
-                self._to_arrow_internal(), where=path, filesystem=filesystem
+                self.to_arrow(), where=path, filesystem=filesystem
             )
         else:
             # otherwise assume destination is directory
             pyarrow.parquet.write_to_dataset(
-                self._to_arrow_internal(), root_path=path, filesystem=filesystem
+                self.to_arrow(), root_path=path, filesystem=filesystem
             )
 
     @property
     def metadata(self) -> Optional[RetrievalMetadata]:
         return self._metadata
+
+    def supports_remote_storage_export(self) -> bool:
+        return False
 
 
 class FileOfflineStore(OfflineStore):
@@ -104,11 +126,17 @@ class FileOfflineStore(OfflineStore):
         feature_views: List[FeatureView],
         feature_refs: List[str],
         entity_df: Union[pd.DataFrame, str],
-        registry: Registry,
+        registry: BaseRegistry,
         project: str,
         full_feature_names: bool = False,
     ) -> RetrievalJob:
-        if not isinstance(entity_df, pd.DataFrame):
+        assert isinstance(config.offline_store, FileOfflineStoreConfig)
+        for fv in feature_views:
+            assert isinstance(fv.batch_source, FileSource)
+
+        if not isinstance(entity_df, pd.DataFrame) and not isinstance(
+            entity_df, dd.DataFrame
+        ):
             raise ValueError(
                 f"Please provide an entity_df of type {type(pd.DataFrame)} instead of type {type(entity_df)}"
             )
@@ -142,156 +170,110 @@ class FileOfflineStore(OfflineStore):
         # Create lazy function that is only called from the RetrievalJob object
         def evaluate_historical_retrieval():
 
-            # Make sure all event timestamp fields are tz-aware. We default tz-naive fields to UTC
-            entity_df[entity_df_event_timestamp_col] = entity_df[
-                entity_df_event_timestamp_col
-            ].apply(lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc))
-
             # Create a copy of entity_df to prevent modifying the original
             entity_df_with_features = entity_df.copy()
 
-            # Convert event timestamp column to datetime and normalize time zone to UTC
-            # This is necessary to avoid issues with pd.merge_asof
-            entity_df_with_features[entity_df_event_timestamp_col] = pd.to_datetime(
-                entity_df_with_features[entity_df_event_timestamp_col], utc=True
-            )
+            entity_df_event_timestamp_col_type = entity_df_with_features.dtypes[
+                entity_df_event_timestamp_col
+            ]
+            if (
+                not hasattr(entity_df_event_timestamp_col_type, "tz")
+                or entity_df_event_timestamp_col_type.tz != pytz.UTC
+            ):
+                # Make sure all event timestamp fields are tz-aware. We default tz-naive fields to UTC
+                entity_df_with_features[
+                    entity_df_event_timestamp_col
+                ] = entity_df_with_features[entity_df_event_timestamp_col].apply(
+                    lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc)
+                )
+
+                # Convert event timestamp column to datetime and normalize time zone to UTC
+                # This is necessary to avoid issues with pd.merge_asof
+                if isinstance(entity_df_with_features, dd.DataFrame):
+                    entity_df_with_features[
+                        entity_df_event_timestamp_col
+                    ] = dd.to_datetime(
+                        entity_df_with_features[entity_df_event_timestamp_col], utc=True
+                    )
+                else:
+                    entity_df_with_features[
+                        entity_df_event_timestamp_col
+                    ] = pd.to_datetime(
+                        entity_df_with_features[entity_df_event_timestamp_col], utc=True
+                    )
 
             # Sort event timestamp values
             entity_df_with_features = entity_df_with_features.sort_values(
                 entity_df_event_timestamp_col
             )
 
+            all_join_keys = []
+
             # Load feature view data from sources and join them incrementally
             for feature_view, features in feature_views_to_features.items():
-                event_timestamp_column = (
-                    feature_view.batch_source.event_timestamp_column
-                )
+                timestamp_field = feature_view.batch_source.timestamp_field
                 created_timestamp_column = (
                     feature_view.batch_source.created_timestamp_column
                 )
 
-                # Read offline parquet data in pyarrow format.
-                filesystem, path = FileSource.create_filesystem_and_path(
-                    feature_view.batch_source.path,
-                    feature_view.batch_source.file_options.s3_endpoint_override,
-                )
-                table = pyarrow.parquet.read_table(path, filesystem=filesystem)
-
-                # Rename columns by the field mapping dictionary if it exists
-                if feature_view.batch_source.field_mapping is not None:
-                    table = _run_field_mapping(
-                        table, feature_view.batch_source.field_mapping
-                    )
-                # Rename entity columns by the join_key_map dictionary if it exists
-                if feature_view.projection.join_key_map:
-                    table = _run_field_mapping(
-                        table, feature_view.projection.join_key_map
-                    )
-
-                # Convert pyarrow table to pandas dataframe. Note, if the underlying data has missing values,
-                # pandas will convert those values to np.nan if the dtypes are numerical (floats, ints, etc.) or boolean
-                # If the dtype is 'object', then missing values are inferred as python `None`s.
-                # More details at:
-                # https://pandas.pydata.org/pandas-docs/stable/user_guide/missing_data.html#values-considered-missing
-                df_to_join = table.to_pandas()
-
-                # Make sure all timestamp fields are tz-aware. We default tz-naive fields to UTC
-                df_to_join[event_timestamp_column] = df_to_join[
-                    event_timestamp_column
-                ].apply(
-                    lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc)
-                )
-                if created_timestamp_column:
-                    df_to_join[created_timestamp_column] = df_to_join[
-                        created_timestamp_column
-                    ].apply(
-                        lambda x: x
-                        if x.tzinfo is not None
-                        else x.replace(tzinfo=pytz.utc)
-                    )
-
-                # Sort dataframe by the event timestamp column
-                df_to_join = df_to_join.sort_values(event_timestamp_column)
-
-                # Build a list of all the features we should select from this source
-                feature_names = []
-                for feature in features:
-                    # Modify the separator for feature refs in column names to double underscore. We are using
-                    # double underscore as separator for consistency with other databases like BigQuery,
-                    # where there are very few characters available for use as separators
-                    if full_feature_names:
-                        formatted_feature_name = (
-                            f"{feature_view.projection.name_to_use()}__{feature}"
-                        )
-                    else:
-                        formatted_feature_name = feature
-                    # Add the feature name to the list of columns
-                    feature_names.append(formatted_feature_name)
-
-                    # Ensure that the source dataframe feature column includes the feature view name as a prefix
-                    df_to_join.rename(
-                        columns={feature: formatted_feature_name}, inplace=True,
-                    )
-
                 # Build a list of entity columns to join on (from the right table)
                 join_keys = []
-                for entity_name in feature_view.entities:
-                    entity = registry.get_entity(entity_name, project)
+
+                for entity_column in feature_view.entity_columns:
                     join_key = feature_view.projection.join_key_map.get(
-                        entity.join_key, entity.join_key
+                        entity_column.name, entity_column.name
                     )
                     join_keys.append(join_key)
-                right_entity_columns = join_keys
+
                 right_entity_key_columns = [
-                    event_timestamp_column
-                ] + right_entity_columns
+                    timestamp_field,
+                    created_timestamp_column,
+                ] + join_keys
+                right_entity_key_columns = [c for c in right_entity_key_columns if c]
 
-                # Remove all duplicate entity keys (using created timestamp)
-                right_entity_key_sort_columns = right_entity_key_columns
-                if created_timestamp_column:
-                    # If created_timestamp is available, use it to dedupe deterministically
-                    right_entity_key_sort_columns = right_entity_key_sort_columns + [
-                        created_timestamp_column
-                    ]
+                all_join_keys = list(set(all_join_keys + join_keys))
 
-                df_to_join.sort_values(by=right_entity_key_sort_columns, inplace=True)
-                df_to_join.drop_duplicates(
-                    right_entity_key_sort_columns,
-                    keep="last",
-                    ignore_index=True,
-                    inplace=True,
-                )
+                df_to_join = _read_datasource(feature_view.batch_source)
 
-                # Select only the columns we need to join from the feature dataframe
-                df_to_join = df_to_join[right_entity_key_columns + feature_names]
-
-                # Do point in-time-join between entity_df and feature dataframe
-                entity_df_with_features = pd.merge_asof(
-                    entity_df_with_features,
+                df_to_join, timestamp_field = _field_mapping(
                     df_to_join,
-                    left_on=entity_df_event_timestamp_col,
-                    right_on=event_timestamp_column,
-                    by=right_entity_columns or None,
-                    tolerance=feature_view.ttl,
+                    feature_view,
+                    features,
+                    right_entity_key_columns,
+                    entity_df_event_timestamp_col,
+                    timestamp_field,
+                    full_feature_names,
                 )
 
-                # Remove right (feature table/view) event_timestamp column.
-                if event_timestamp_column != entity_df_event_timestamp_col:
-                    entity_df_with_features.drop(
-                        columns=[event_timestamp_column], inplace=True
-                    )
+                df_to_join = _merge(entity_df_with_features, df_to_join, join_keys)
+
+                df_to_join = _normalize_timestamp(
+                    df_to_join, timestamp_field, created_timestamp_column
+                )
+
+                df_to_join = _filter_ttl(
+                    df_to_join,
+                    feature_view,
+                    entity_df_event_timestamp_col,
+                    timestamp_field,
+                )
+
+                df_to_join = _drop_duplicates(
+                    df_to_join,
+                    all_join_keys,
+                    timestamp_field,
+                    created_timestamp_column,
+                    entity_df_event_timestamp_col,
+                )
+
+                entity_df_with_features = _drop_columns(
+                    df_to_join, timestamp_field, created_timestamp_column
+                )
 
                 # Ensure that we delete dataframes to free up memory
                 del df_to_join
 
-            # Move "event_timestamp" column to front
-            current_cols = entity_df_with_features.columns.tolist()
-            current_cols.remove(entity_df_event_timestamp_col)
-            entity_df_with_features = entity_df_with_features[
-                [entity_df_event_timestamp_col] + current_cols
-            ]
-
-            return entity_df_with_features
+            return entity_df_with_features.persist()
 
         job = FileRetrievalJob(
             evaluation_function=evaluate_historical_retrieval,
@@ -315,29 +297,21 @@ class FileOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         created_timestamp_column: Optional[str],
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
+        assert isinstance(config.offline_store, FileOfflineStoreConfig)
         assert isinstance(data_source, FileSource)
 
         # Create lazy function that is only called from the RetrievalJob object
         def evaluate_offline_job():
-            filesystem, path = FileSource.create_filesystem_and_path(
-                data_source.path, data_source.file_options.s3_endpoint_override
+            source_df = _read_datasource(data_source)
+
+            source_df = _normalize_timestamp(
+                source_df, timestamp_field, created_timestamp_column
             )
-            source_df = pd.read_parquet(path, filesystem=filesystem)
-            # Make sure all timestamp fields are tz-aware. We default tz-naive fields to UTC
-            source_df[event_timestamp_column] = source_df[event_timestamp_column].apply(
-                lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc)
-            )
-            if created_timestamp_column:
-                source_df[created_timestamp_column] = source_df[
-                    created_timestamp_column
-                ].apply(
-                    lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc)
-                )
 
             source_columns = set(source_df.columns)
             if not set(join_key_columns).issubset(source_columns):
@@ -346,35 +320,56 @@ class FileOfflineStore(OfflineStore):
                 )
 
             ts_columns = (
-                [event_timestamp_column, created_timestamp_column]
+                [timestamp_field, created_timestamp_column]
                 if created_timestamp_column
-                else [event_timestamp_column]
+                else [timestamp_field]
             )
+            # try-catch block is added to deal with this issue https://github.com/dask/dask/issues/8939.
+            # TODO(kevjumba): remove try catch when fix is merged upstream in Dask.
+            try:
+                if created_timestamp_column:
+                    source_df = source_df.sort_values(
+                        by=created_timestamp_column,
+                    )
 
-            source_df.sort_values(by=ts_columns, inplace=True)
+                source_df = source_df.sort_values(by=timestamp_field)
 
-            filtered_df = source_df[
-                (source_df[event_timestamp_column] >= start_date)
-                & (source_df[event_timestamp_column] < end_date)
+            except ZeroDivisionError:
+                # Use 1 partition to get around case where everything in timestamp column is the same so the partition algorithm doesn't
+                # try to divide by zero.
+                if created_timestamp_column:
+                    source_df = source_df.sort_values(
+                        by=created_timestamp_column, npartitions=1
+                    )
+
+                source_df = source_df.sort_values(by=timestamp_field, npartitions=1)
+
+            source_df = source_df[
+                (source_df[timestamp_field] >= start_date)
+                & (source_df[timestamp_field] < end_date)
             ]
+
+            source_df = source_df.persist()
 
             columns_to_extract = set(
                 join_key_columns + feature_name_columns + ts_columns
             )
             if join_key_columns:
-                last_values_df = filtered_df.drop_duplicates(
+                source_df = source_df.drop_duplicates(
                     join_key_columns, keep="last", ignore_index=True
                 )
             else:
-                last_values_df = filtered_df
-                last_values_df[DUMMY_ENTITY_ID] = DUMMY_ENTITY_VAL
+                source_df[DUMMY_ENTITY_ID] = DUMMY_ENTITY_VAL
                 columns_to_extract.add(DUMMY_ENTITY_ID)
 
-            return last_values_df[columns_to_extract]
+            source_df = source_df.persist()
+
+            return source_df[list(columns_to_extract)].persist()
 
         # When materializing a single feature view, we don't need full feature names. On demand transforms aren't materialized
         return FileRetrievalJob(
-            evaluation_function=evaluate_offline_job, full_feature_names=False,
+            evaluation_function=evaluate_offline_job,
+            full_feature_names=False,
         )
 
     @staticmethod
@@ -384,25 +379,94 @@ class FileOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
+        assert isinstance(config.offline_store, FileOfflineStoreConfig)
+        assert isinstance(data_source, FileSource)
+
         return FileOfflineStore.pull_latest_from_table_or_query(
             config=config,
             data_source=data_source,
             join_key_columns=join_key_columns
-            + [event_timestamp_column],  # avoid deduplication
+            + [timestamp_field],  # avoid deduplication
             feature_name_columns=feature_name_columns,
-            event_timestamp_column=event_timestamp_column,
+            timestamp_field=timestamp_field,
             created_timestamp_column=None,
             start_date=start_date,
             end_date=end_date,
         )
 
+    @staticmethod
+    def write_logged_features(
+        config: RepoConfig,
+        data: Union[pyarrow.Table, Path],
+        source: LoggingSource,
+        logging_config: LoggingConfig,
+        registry: BaseRegistry,
+    ):
+        assert isinstance(config.offline_store, FileOfflineStoreConfig)
+        destination = logging_config.destination
+        assert isinstance(destination, FileLoggingDestination)
+
+        if isinstance(data, Path):
+            # Since this code will be mostly used from Go-created thread, it's better to avoid producing new threads
+            data = pyarrow.parquet.read_table(data, use_threads=False, pre_buffer=False)
+
+        filesystem, path = FileSource.create_filesystem_and_path(
+            destination.path,
+            destination.s3_endpoint_override,
+        )
+
+        pyarrow.dataset.write_dataset(
+            data,
+            base_dir=path,
+            basename_template=f"{uuid.uuid4().hex}-{{i}}.parquet",
+            partitioning=destination.partition_by,
+            filesystem=filesystem,
+            use_threads=False,
+            format=pyarrow.dataset.ParquetFileFormat(),
+            existing_data_behavior="overwrite_or_ignore",
+        )
+
+    @staticmethod
+    def offline_write_batch(
+        config: RepoConfig,
+        feature_view: FeatureView,
+        table: pyarrow.Table,
+        progress: Optional[Callable[[int], Any]],
+    ):
+        assert isinstance(config.offline_store, FileOfflineStoreConfig)
+        assert isinstance(feature_view.batch_source, FileSource)
+
+        pa_schema, column_names = get_pyarrow_schema_from_batch_source(
+            config, feature_view.batch_source
+        )
+        if column_names != table.column_names:
+            raise ValueError(
+                f"The input pyarrow table has schema {table.schema} with the incorrect columns {table.column_names}. "
+                f"The schema is expected to be {pa_schema} with the columns (in this exact order) to be {column_names}."
+            )
+
+        file_options = feature_view.batch_source.file_options
+        filesystem, path = FileSource.create_filesystem_and_path(
+            file_options.uri, file_options.s3_endpoint_override
+        )
+        prev_table = pyarrow.parquet.read_table(path, memory_map=True)
+        if table.schema != prev_table.schema:
+            table = table.cast(prev_table.schema)
+        new_table = pyarrow.concat_tables([table, prev_table])
+        writer = pyarrow.parquet.ParquetWriter(
+            path, table.schema, filesystem=filesystem
+        )
+        writer.write_table(new_table)
+        writer.close()
+
 
 def _get_entity_df_event_timestamp_range(
-    entity_df: Union[pd.DataFrame, str], entity_df_event_timestamp_col: str,
+    entity_df: Union[pd.DataFrame, str],
+    entity_df_event_timestamp_col: str,
 ) -> Tuple[datetime, datetime]:
     if not isinstance(entity_df, pd.DataFrame):
         raise ValueError(
@@ -419,3 +483,213 @@ def _get_entity_df_event_timestamp_range(
         entity_df_event_timestamp.min().to_pydatetime(),
         entity_df_event_timestamp.max().to_pydatetime(),
     )
+
+
+def _read_datasource(data_source) -> dd.DataFrame:
+    storage_options = (
+        {
+            "client_kwargs": {
+                "endpoint_url": data_source.file_options.s3_endpoint_override
+            }
+        }
+        if data_source.file_options.s3_endpoint_override
+        else None
+    )
+
+    return dd.read_parquet(
+        data_source.path,
+        storage_options=storage_options,
+    )
+
+
+def _field_mapping(
+    df_to_join: dd.DataFrame,
+    feature_view: FeatureView,
+    features: List[str],
+    right_entity_key_columns: List[str],
+    entity_df_event_timestamp_col: str,
+    timestamp_field: str,
+    full_feature_names: bool,
+) -> Tuple[dd.DataFrame, str]:
+    # Rename columns by the field mapping dictionary if it exists
+    if feature_view.batch_source.field_mapping:
+        df_to_join = _run_dask_field_mapping(
+            df_to_join, feature_view.batch_source.field_mapping
+        )
+    # Rename entity columns by the join_key_map dictionary if it exists
+    if feature_view.projection.join_key_map:
+        df_to_join = _run_dask_field_mapping(
+            df_to_join, feature_view.projection.join_key_map
+        )
+
+    # Build a list of all the features we should select from this source
+    feature_names = []
+    columns_map = {}
+    for feature in features:
+        # Modify the separator for feature refs in column names to double underscore. We are using
+        # double underscore as separator for consistency with other databases like BigQuery,
+        # where there are very few characters available for use as separators
+        if full_feature_names:
+            formatted_feature_name = (
+                f"{feature_view.projection.name_to_use()}__{feature}"
+            )
+        else:
+            formatted_feature_name = feature
+        # Add the feature name to the list of columns
+        feature_names.append(formatted_feature_name)
+        columns_map[feature] = formatted_feature_name
+
+    # Ensure that the source dataframe feature column includes the feature view name as a prefix
+    df_to_join = _run_dask_field_mapping(df_to_join, columns_map)
+
+    # Select only the columns we need to join from the feature dataframe
+    df_to_join = df_to_join[right_entity_key_columns + feature_names]
+    df_to_join = df_to_join.persist()
+
+    # Make sure to not have duplicated columns
+    if entity_df_event_timestamp_col == timestamp_field:
+        df_to_join = _run_dask_field_mapping(
+            df_to_join,
+            {timestamp_field: f"__{timestamp_field}"},
+        )
+        timestamp_field = f"__{timestamp_field}"
+
+    return df_to_join.persist(), timestamp_field
+
+
+def _merge(
+    entity_df_with_features: dd.DataFrame,
+    df_to_join: dd.DataFrame,
+    join_keys: List[str],
+) -> dd.DataFrame:
+    # tmp join keys needed for cross join with null join table view
+    tmp_join_keys = []
+    if not join_keys:
+        entity_df_with_features["__tmp"] = 1
+        df_to_join["__tmp"] = 1
+        tmp_join_keys = ["__tmp"]
+
+    # Get only data with requested entities
+    df_to_join = dd.merge(
+        entity_df_with_features,
+        df_to_join,
+        left_on=join_keys or tmp_join_keys,
+        right_on=join_keys or tmp_join_keys,
+        suffixes=("", "__"),
+        how="left",
+    )
+
+    if tmp_join_keys:
+        df_to_join = df_to_join.drop(tmp_join_keys, axis=1).persist()
+    else:
+        df_to_join = df_to_join.persist()
+
+    return df_to_join
+
+
+def _normalize_timestamp(
+    df_to_join: dd.DataFrame,
+    timestamp_field: str,
+    created_timestamp_column: str,
+) -> dd.DataFrame:
+    df_to_join_types = df_to_join.dtypes
+    timestamp_field_type = df_to_join_types[timestamp_field]
+
+    if created_timestamp_column:
+        created_timestamp_column_type = df_to_join_types[created_timestamp_column]
+
+    if not hasattr(timestamp_field_type, "tz") or timestamp_field_type.tz != pytz.UTC:
+        # Make sure all timestamp fields are tz-aware. We default tz-naive fields to UTC
+        df_to_join[timestamp_field] = df_to_join[timestamp_field].apply(
+            lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc),
+            meta=(timestamp_field, "datetime64[ns, UTC]"),
+        )
+
+    if created_timestamp_column and (
+        not hasattr(created_timestamp_column_type, "tz")
+        or created_timestamp_column_type.tz != pytz.UTC
+    ):
+        df_to_join[created_timestamp_column] = df_to_join[
+            created_timestamp_column
+        ].apply(
+            lambda x: x if x.tzinfo is not None else x.replace(tzinfo=pytz.utc),
+            meta=(timestamp_field, "datetime64[ns, UTC]"),
+        )
+
+    return df_to_join.persist()
+
+
+def _filter_ttl(
+    df_to_join: dd.DataFrame,
+    feature_view: FeatureView,
+    entity_df_event_timestamp_col: str,
+    timestamp_field: str,
+) -> dd.DataFrame:
+    # Filter rows by defined timestamp tolerance
+    if feature_view.ttl and feature_view.ttl.total_seconds() != 0:
+        df_to_join = df_to_join[
+            # do not drop entity rows if one of the sources returns NaNs
+            df_to_join[timestamp_field].isna()
+            | (
+                (
+                    df_to_join[timestamp_field]
+                    >= df_to_join[entity_df_event_timestamp_col] - feature_view.ttl
+                )
+                & (
+                    df_to_join[timestamp_field]
+                    <= df_to_join[entity_df_event_timestamp_col]
+                )
+            )
+        ]
+
+        df_to_join = df_to_join.persist()
+    else:
+        df_to_join = df_to_join[
+            # do not drop entity rows if one of the sources returns NaNs
+            df_to_join[timestamp_field].isna()
+            | (df_to_join[timestamp_field] <= df_to_join[entity_df_event_timestamp_col])
+        ]
+
+        df_to_join = df_to_join.persist()
+
+    return df_to_join
+
+
+def _drop_duplicates(
+    df_to_join: dd.DataFrame,
+    all_join_keys: List[str],
+    timestamp_field: str,
+    created_timestamp_column: str,
+    entity_df_event_timestamp_col: str,
+) -> dd.DataFrame:
+    if created_timestamp_column:
+        df_to_join = df_to_join.sort_values(
+            by=created_timestamp_column, na_position="first"
+        )
+        df_to_join = df_to_join.persist()
+
+    df_to_join = df_to_join.sort_values(by=timestamp_field, na_position="first")
+    df_to_join = df_to_join.persist()
+
+    df_to_join = df_to_join.drop_duplicates(
+        all_join_keys + [entity_df_event_timestamp_col],
+        keep="last",
+        ignore_index=True,
+    )
+
+    return df_to_join.persist()
+
+
+def _drop_columns(
+    df_to_join: dd.DataFrame,
+    timestamp_field: str,
+    created_timestamp_column: str,
+) -> dd.DataFrame:
+    entity_df_with_features = df_to_join.drop([timestamp_field], axis=1).persist()
+
+    if created_timestamp_column:
+        entity_df_with_features = entity_df_with_features.drop(
+            [created_timestamp_column], axis=1
+        ).persist()
+
+    return entity_df_with_features

@@ -20,10 +20,9 @@ syntax = "proto3";
 package feast.core;
 option java_package = "feast.proto.core";
 option java_outer_classname = "SavedDatasetProto";
-option go_package = "github.com/feast-dev/feast/sdk/go/protos/feast/core";
+option go_package = "github.com/feast-dev/feast/go/protos/feast/core";
 
 import "google/protobuf/timestamp.proto";
-import "feast/core/FeatureViewProjection.proto";
 import "feast/core/DataSource.proto";
 
 message SavedDatasetSpec {
@@ -44,6 +43,9 @@ message SavedDatasetSpec {
 
   SavedDatasetStorage storage = 6;
 
+  // Optional and only populated if generated from a feature service fetch
+  string feature_service_name = 8;
+
   // User defined metadata
   map<string, string> tags = 7;
 }
@@ -53,6 +55,11 @@ message SavedDatasetStorage {
     DataSource.FileOptions file_storage = 4;
     DataSource.BigQueryOptions bigquery_storage = 5;
     DataSource.RedshiftOptions redshift_storage = 6;
+    DataSource.SnowflakeOptions snowflake_storage = 7;
+    DataSource.TrinoOptions trino_storage = 8;
+    DataSource.SparkOptions spark_storage = 9;
+    DataSource.CustomSourceOptions custom_storage = 10;
+    DataSource.AthenaOptions athena_storage = 11;
   }
 }
 

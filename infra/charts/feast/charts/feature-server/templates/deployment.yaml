@@ -21,6 +21,9 @@ spec:
       annotations:
         checksum/configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      {{- if .Values.podAnnotations }}
+        {{ toYaml .Values.podAnnotations | nindent 8 }}
+      {{- end }}
       labels:
         app: {{ template "feature-server.name" . }}
         component: serving
@@ -103,8 +106,6 @@ spec:
           {{- end }}
 
         ports:
-        - name: http
-          containerPort: {{ .Values.service.http.targetPort }}
         - name: grpc
           containerPort: {{ .Values.service.grpc.targetPort }}
 

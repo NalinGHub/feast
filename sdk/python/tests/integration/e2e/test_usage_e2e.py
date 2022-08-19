@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# This file tests our usage tracking system in `usage.py`.
 import os
 import sys
 import tempfile
@@ -19,7 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
-from feast import Entity, RepoConfig, ValueType
+from feast import Entity, RepoConfig
 from feast.infra.online_stores.sqlite import SqliteOnlineStoreConfig
 
 
@@ -55,21 +57,27 @@ def test_usage_on(dummy_exporter, enabling_toggle):
                 online_store=SqliteOnlineStoreConfig(
                     path=os.path.join(temp_dir, "online.db")
                 ),
+                entity_key_serialization_version=2,
             )
         )
         entity = Entity(
             name="driver_car_id",
             description="Car driver id",
-            value_type=ValueType.STRING,
-            labels={"team": "matchmaking"},
+            tags={"team": "matchmaking"},
         )
 
         test_feature_store.apply([entity])
 
-        assert len(dummy_exporter) == 1
+        assert len(dummy_exporter) == 3
+        assert {
+            "entrypoint": "feast.infra.registry.file.FileRegistryStore.get_registry_proto"
+        }.items() <= dummy_exporter[0].items()
+        assert {
+            "entrypoint": "feast.infra.registry.file.FileRegistryStore.update_registry_proto"
+        }.items() <= dummy_exporter[1].items()
         assert {
             "entrypoint": "feast.feature_store.FeatureStore.apply"
-        }.items() <= dummy_exporter[0].items()
+        }.items() <= dummy_exporter[2].items()
 
 
 @pytest.mark.integration
@@ -88,13 +96,13 @@ def test_usage_off(dummy_exporter, enabling_toggle):
                 online_store=SqliteOnlineStoreConfig(
                     path=os.path.join(temp_dir, "online.db")
                 ),
+                entity_key_serialization_version=2,
             )
         )
         entity = Entity(
             name="driver_car_id",
             description="Car driver id",
-            value_type=ValueType.STRING,
-            labels={"team": "matchmaking"},
+            tags={"team": "matchmaking"},
         )
         test_feature_store.apply([entity])
 
@@ -130,9 +138,9 @@ def test_exception_usage_off(dummy_exporter, enabling_toggle):
 
 
 def _reload_feast():
-    """ After changing environment need to reload modules and rerun usage decorators """
+    """After changing environment need to reload modules and rerun usage decorators"""
     modules = (
-        "feast.infra.local",
+        "feast.infra.registry.file",
         "feast.infra.online_stores.sqlite",
         "feast.feature_store",
     )

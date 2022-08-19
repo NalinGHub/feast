@@ -1,7 +1,10 @@
 import contextlib
+import tempfile
 import uuid
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import (
+    Any,
     Callable,
     ContextManager,
     Dict,
@@ -28,6 +31,7 @@ from feast.errors import (
     FeastProviderLoginError,
     InvalidEntityType,
 )
+from feast.feature_logging import LoggingConfig, LoggingSource
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL, FeatureView
 from feast.infra.offline_stores import offline_utils
 from feast.infra.offline_stores.offline_store import (
@@ -35,19 +39,26 @@ from feast.infra.offline_stores.offline_store import (
     RetrievalJob,
     RetrievalMetadata,
 )
+from feast.infra.registry.base_registry import BaseRegistry
 from feast.on_demand_feature_view import OnDemandFeatureView
-from feast.registry import Registry
 from feast.repo_config import FeastConfigBaseModel, RepoConfig
 
 from ...saved_dataset import SavedDatasetStorage
-from ...usage import log_exceptions_and_usage
-from .bigquery_source import BigQuerySource, SavedDatasetBigQueryStorage
+from ...usage import get_user_agent, log_exceptions_and_usage
+from .bigquery_source import (
+    BigQueryLoggingDestination,
+    BigQuerySource,
+    SavedDatasetBigQueryStorage,
+)
 
 try:
+    from google.api_core import client_info as http_client_info
     from google.api_core.exceptions import NotFound
     from google.auth.exceptions import DefaultCredentialsError
     from google.cloud import bigquery
-    from google.cloud.bigquery import Client, Table
+    from google.cloud.bigquery import Client, SchemaField, Table
+    from google.cloud.bigquery._pandas_helpers import ARROW_SCALAR_IDS_TO_BQ
+    from google.cloud.storage import Client as StorageClient
 
 except ImportError as e:
     from feast.errors import FeastExtrasDependencyImportError
@@ -55,8 +66,12 @@ except ImportError as e:
     raise FeastExtrasDependencyImportError("gcp", str(e))
 
 
+def get_http_client_info():
+    return http_client_info.ClientInfo(user_agent=get_user_agent())
+
+
 class BigQueryOfflineStoreConfig(FeastConfigBaseModel):
-    """ Offline store config for GCP BigQuery """
+    """Offline store config for GCP BigQuery"""
 
     type: Literal["bigquery"] = "bigquery"
     """ Offline store type selector"""
@@ -74,6 +89,9 @@ class BigQueryOfflineStoreConfig(FeastConfigBaseModel):
     For more information on BigQuery data locations see: https://cloud.google.com/bigquery/docs/locations
     """
 
+    gcs_staging_location: Optional[str] = None
+    """ (optional) GCS location used for offloading BigQuery results as parquet files."""
+
 
 class BigQueryOfflineStore(OfflineStore):
     @staticmethod
@@ -83,11 +101,12 @@ class BigQueryOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         created_timestamp_column: Optional[str],
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
+        assert isinstance(config.offline_store, BigQueryOfflineStoreConfig)
         assert isinstance(data_source, BigQuerySource)
         from_expression = data_source.get_table_query_string()
 
@@ -96,7 +115,7 @@ class BigQueryOfflineStore(OfflineStore):
             partition_by_join_key_string = (
                 "PARTITION BY " + partition_by_join_key_string
             )
-        timestamps = [event_timestamp_column]
+        timestamps = [timestamp_field]
         if created_timestamp_column:
             timestamps.append(created_timestamp_column)
         timestamp_desc_string = " DESC, ".join(timestamps) + " DESC"
@@ -114,14 +133,17 @@ class BigQueryOfflineStore(OfflineStore):
                 SELECT {field_string},
                 ROW_NUMBER() OVER({partition_by_join_key_string} ORDER BY {timestamp_desc_string}) AS _feast_row
                 FROM {from_expression}
-                WHERE {event_timestamp_column} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
+                WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
             )
             WHERE _feast_row = 1
             """
 
         # When materializing a single feature view, we don't need full feature names. On demand transforms aren't materialized
         return BigQueryRetrievalJob(
-            query=query, client=client, config=config, full_feature_names=False,
+            query=query,
+            client=client,
+            config=config,
+            full_feature_names=False,
         )
 
     @staticmethod
@@ -131,10 +153,11 @@ class BigQueryOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
+        assert isinstance(config.offline_store, BigQueryOfflineStoreConfig)
         assert isinstance(data_source, BigQuerySource)
         from_expression = data_source.get_table_query_string()
 
@@ -143,15 +166,18 @@ class BigQueryOfflineStore(OfflineStore):
             location=config.offline_store.location,
         )
         field_string = ", ".join(
-            join_key_columns + feature_name_columns + [event_timestamp_column]
+            join_key_columns + feature_name_columns + [timestamp_field]
         )
         query = f"""
             SELECT {field_string}
             FROM {from_expression}
-            WHERE {event_timestamp_column} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
+            WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
         """
         return BigQueryRetrievalJob(
-            query=query, client=client, config=config, full_feature_names=False,
+            query=query,
+            client=client,
+            config=config,
+            full_feature_names=False,
         )
 
     @staticmethod
@@ -161,12 +187,14 @@ class BigQueryOfflineStore(OfflineStore):
         feature_views: List[FeatureView],
         feature_refs: List[str],
         entity_df: Union[pd.DataFrame, str],
-        registry: Registry,
+        registry: BaseRegistry,
         project: str,
         full_feature_names: bool = False,
     ) -> RetrievalJob:
         # TODO: Add entity_df validation in order to fail before interacting with BigQuery
         assert isinstance(config.offline_store, BigQueryOfflineStoreConfig)
+        for fv in feature_views:
+            assert isinstance(fv.batch_source, BigQuerySource)
 
         client = _get_bigquery_client(
             project=config.offline_store.project_id,
@@ -182,20 +210,27 @@ class BigQueryOfflineStore(OfflineStore):
             config.offline_store.location,
         )
 
-        entity_schema = _get_entity_schema(client=client, entity_df=entity_df,)
+        entity_schema = _get_entity_schema(
+            client=client,
+            entity_df=entity_df,
+        )
 
-        entity_df_event_timestamp_col = offline_utils.infer_event_timestamp_from_entity_df(
-            entity_schema
+        entity_df_event_timestamp_col = (
+            offline_utils.infer_event_timestamp_from_entity_df(entity_schema)
         )
 
         entity_df_event_timestamp_range = _get_entity_df_event_timestamp_range(
-            entity_df, entity_df_event_timestamp_col, client,
+            entity_df,
+            entity_df_event_timestamp_col,
+            client,
         )
 
         @contextlib.contextmanager
         def query_generator() -> Iterator[str]:
             _upload_entity_df(
-                client=client, table_name=table_reference, entity_df=entity_df,
+                client=client,
+                table_name=table_reference,
+                entity_df=entity_df,
             )
 
             expected_join_keys = offline_utils.get_expected_join_keys(
@@ -248,6 +283,97 @@ class BigQueryOfflineStore(OfflineStore):
             ),
         )
 
+    @staticmethod
+    def write_logged_features(
+        config: RepoConfig,
+        data: Union[pyarrow.Table, Path],
+        source: LoggingSource,
+        logging_config: LoggingConfig,
+        registry: BaseRegistry,
+    ):
+        destination = logging_config.destination
+        assert isinstance(destination, BigQueryLoggingDestination)
+
+        client = _get_bigquery_client(
+            project=config.offline_store.project_id,
+            location=config.offline_store.location,
+        )
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            schema=arrow_schema_to_bq_schema(source.get_schema(registry)),
+            time_partitioning=bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field=source.get_log_timestamp_column(),
+            ),
+        )
+
+        if isinstance(data, Path):
+            for file in data.iterdir():
+                with file.open("rb") as f:
+                    client.load_table_from_file(
+                        file_obj=f,
+                        destination=destination.table,
+                        job_config=job_config,
+                    ).result()
+
+            return
+
+        with tempfile.TemporaryFile() as parquet_temp_file:
+            pyarrow.parquet.write_table(table=data, where=parquet_temp_file)
+
+            parquet_temp_file.seek(0)
+
+            client.load_table_from_file(
+                file_obj=parquet_temp_file,
+                destination=destination.table,
+                job_config=job_config,
+            ).result()
+
+    @staticmethod
+    def offline_write_batch(
+        config: RepoConfig,
+        feature_view: FeatureView,
+        table: pyarrow.Table,
+        progress: Optional[Callable[[int], Any]],
+    ):
+        assert isinstance(config.offline_store, BigQueryOfflineStoreConfig)
+        assert isinstance(feature_view.batch_source, BigQuerySource)
+
+        pa_schema, column_names = offline_utils.get_pyarrow_schema_from_batch_source(
+            config, feature_view.batch_source
+        )
+        if column_names != table.column_names:
+            raise ValueError(
+                f"The input pyarrow table has schema {table.schema} with the incorrect columns {table.column_names}. "
+                f"The schema is expected to be {pa_schema} with the columns (in this exact order) to be {column_names}."
+            )
+
+        if table.schema != pa_schema:
+            table = table.cast(pa_schema)
+
+        client = _get_bigquery_client(
+            project=config.offline_store.project_id,
+            location=config.offline_store.location,
+        )
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            schema=arrow_schema_to_bq_schema(pa_schema),
+            write_disposition="WRITE_APPEND",  # Default but included for clarity
+        )
+
+        with tempfile.TemporaryFile() as parquet_temp_file:
+            pyarrow.parquet.write_table(table=table, where=parquet_temp_file)
+
+            parquet_temp_file.seek(0)
+
+            client.load_table_from_file(
+                file_obj=parquet_temp_file,
+                destination=feature_view.batch_source.table,
+                job_config=job_config,
+            ).result()
+
 
 class BigQueryRetrievalJob(RetrievalJob):
     def __init__(
@@ -272,17 +398,23 @@ class BigQueryRetrievalJob(RetrievalJob):
         self.client = client
         self.config = config
         self._full_feature_names = full_feature_names
-        self._on_demand_feature_views = (
-            on_demand_feature_views if on_demand_feature_views else []
-        )
+        self._on_demand_feature_views = on_demand_feature_views or []
         self._metadata = metadata
+        if self.config.offline_store.gcs_staging_location:
+            self._gcs_path = (
+                self.config.offline_store.gcs_staging_location
+                + f"/{self.config.project}/export/"
+                + str(uuid.uuid4())
+            )
+        else:
+            self._gcs_path = None
 
     @property
     def full_feature_names(self) -> bool:
         return self._full_feature_names
 
     @property
-    def on_demand_feature_views(self) -> Optional[List[OnDemandFeatureView]]:
+    def on_demand_feature_views(self) -> List[OnDemandFeatureView]:
         return self._on_demand_feature_views
 
     def _to_df_internal(self) -> pd.DataFrame:
@@ -291,29 +423,27 @@ class BigQueryRetrievalJob(RetrievalJob):
             return df
 
     def to_sql(self) -> str:
-        """
-        Returns the SQL query that will be executed in BigQuery to build the historical feature table.
-        """
+        """Returns the underlying SQL query."""
         with self._query_generator() as query:
             return query
 
     def to_bigquery(
         self,
-        job_config: bigquery.QueryJobConfig = None,
+        job_config: Optional[bigquery.QueryJobConfig] = None,
         timeout: int = 1800,
         retry_cadence: int = 10,
-    ) -> Optional[str]:
+    ) -> str:
         """
-        Triggers the execution of a historical feature retrieval query and exports the results to a BigQuery table.
-        Runs for a maximum amount of time specified by the timeout parameter (defaulting to 30 minutes).
+        Synchronously executes the underlying query and exports the result to a BigQuery table. The
+        underlying BigQuery job runs for a limited amount of time (the default is 30 minutes).
 
         Args:
-            job_config: An optional bigquery.QueryJobConfig to specify options like destination table, dry run, etc.
-            timeout: An optional number of seconds for setting the time limit of the QueryJob.
-            retry_cadence: An optional number of seconds for setting how long the job should checked for completion.
+            job_config (optional): A bigquery.QueryJobConfig to specify options like the destination table, dry run, etc.
+            timeout (optional): The time limit of the BigQuery job in seconds. Defaults to 30 minutes.
+            retry_cadence (optional): The number of seconds for setting how long the job should checked for completion.
 
         Returns:
-            Returns the destination table name or returns None if job_config.dry_run is True.
+            Returns the destination table name or None if job_config.dry_run is True.
         """
 
         if not job_config:
@@ -338,12 +468,14 @@ class BigQueryRetrievalJob(RetrievalJob):
 
     def _to_arrow_internal(self) -> pyarrow.Table:
         with self._query_generator() as query:
-            return self._execute_query(query).to_arrow()
+            q = self._execute_query(query=query)
+            assert q
+            return q.to_arrow()
 
     @log_exceptions_and_usage
     def _execute_query(
         self, query, job_config=None, timeout: int = 1800
-    ) -> bigquery.job.query.QueryJob:
+    ) -> Optional[bigquery.job.query.QueryJob]:
         bq_job = self.client.query(query, job_config=job_config)
 
         if job_config and job_config.dry_run:
@@ -355,16 +487,53 @@ class BigQueryRetrievalJob(RetrievalJob):
         block_until_done(client=self.client, bq_job=bq_job, timeout=timeout)
         return bq_job
 
-    def persist(self, storage: SavedDatasetStorage):
+    def persist(self, storage: SavedDatasetStorage, allow_overwrite: bool = False):
         assert isinstance(storage, SavedDatasetBigQueryStorage)
 
         self.to_bigquery(
-            bigquery.QueryJobConfig(destination=storage.bigquery_options.table_ref)
+            bigquery.QueryJobConfig(destination=storage.bigquery_options.table)
         )
 
     @property
     def metadata(self) -> Optional[RetrievalMetadata]:
         return self._metadata
+
+    def supports_remote_storage_export(self) -> bool:
+        return self._gcs_path is not None
+
+    def to_remote_storage(self) -> List[str]:
+        if not self._gcs_path:
+            raise ValueError(
+                "gcs_staging_location needs to be specified for the big query "
+                "offline store when executing `to_remote_storage()`"
+            )
+
+        table = self.to_bigquery()
+
+        job_config = bigquery.job.ExtractJobConfig()
+        job_config.destination_format = "PARQUET"
+
+        extract_job = self.client.extract_table(
+            table,
+            destination_uris=[f"{self._gcs_path}/*.parquet"],
+            location=self.config.offline_store.location,
+            job_config=job_config,
+        )
+        extract_job.result()
+
+        bucket: str
+        prefix: str
+        storage_client = StorageClient(project=self.client.project)
+        bucket, prefix = self._gcs_path[len("gs://") :].split("/", 1)
+        prefix = prefix.rsplit("/", 1)[0]
+        if prefix.startswith("/"):
+            prefix = prefix[1:]
+
+        blobs = storage_client.list_blobs(bucket, prefix=prefix)
+        results = []
+        for b in blobs:
+            results.append(f"gs://{b.bucket.name}/{b.name}")
+        return results
 
 
 def block_until_done(
@@ -406,7 +575,7 @@ def block_until_done(
 
     finally:
         if client.get_job(bq_job).state in ["PENDING", "RUNNING"]:
-            client.cancel_job(bq_job)
+            client.cancel_job(bq_job.job_id)
             raise BigQueryJobCancelled(job_id=bq_job.job_id)
 
         if bq_job.exception():
@@ -426,7 +595,7 @@ def _get_table_reference_for_new_entity(
     dataset.location = dataset_location if dataset_location else "US"
 
     try:
-        client.get_dataset(dataset)
+        client.get_dataset(dataset.reference)
     except NotFound:
         # Only create the dataset if it does not exist
         client.create_dataset(dataset, exists_ok=True)
@@ -437,9 +606,12 @@ def _get_table_reference_for_new_entity(
 
 
 def _upload_entity_df(
-    client: Client, table_name: str, entity_df: Union[pd.DataFrame, str],
+    client: Client,
+    table_name: str,
+    entity_df: Union[pd.DataFrame, str],
 ) -> Table:
     """Uploads a Pandas entity dataframe into a BigQuery table and returns the resulting table"""
+    job: Union[bigquery.job.query.QueryJob, bigquery.job.load.LoadJob]
 
     if isinstance(entity_df, str):
         job = client.query(f"CREATE TABLE {table_name} AS ({entity_df})")
@@ -511,9 +683,13 @@ def _get_entity_df_event_timestamp_range(
     return entity_df_event_timestamp_range
 
 
-def _get_bigquery_client(project: Optional[str] = None, location: Optional[str] = None):
+def _get_bigquery_client(
+    project: Optional[str] = None, location: Optional[str] = None
+) -> bigquery.Client:
     try:
-        client = bigquery.Client(project=project, location=location)
+        client = bigquery.Client(
+            project=project, location=location, client_info=get_http_client_info()
+        )
     except DefaultCredentialsError as e:
         raise FeastProviderLoginError(
             str(e)
@@ -529,6 +705,24 @@ def _get_bigquery_client(project: Optional[str] = None, location: Optional[str] 
         )
 
     return client
+
+
+def arrow_schema_to_bq_schema(arrow_schema: pyarrow.Schema) -> List[SchemaField]:
+    bq_schema = []
+
+    for field in arrow_schema:
+        if pyarrow.types.is_list(field.type):
+            detected_mode = "REPEATED"
+            detected_type = ARROW_SCALAR_IDS_TO_BQ[field.type.value_type.id]
+        else:
+            detected_mode = "NULLABLE"
+            detected_type = ARROW_SCALAR_IDS_TO_BQ[field.type.id]
+
+        bq_schema.append(
+            SchemaField(name=field.name, field_type=detected_type, mode=detected_mode)
+        )
+
+    return bq_schema
 
 
 # TODO: Optimizations
@@ -581,9 +775,9 @@ WITH entity_dataframe AS (
 
  1. We first join the current feature_view to the entity dataframe that has been passed.
  This JOIN has the following logic:
-    - For each row of the entity dataframe, only keep the rows where the `event_timestamp_column`
+    - For each row of the entity dataframe, only keep the rows where the `timestamp_field`
     is less than the one provided in the entity dataframe
-    - If there a TTL for the current feature_view, also keep the rows where the `event_timestamp_column`
+    - If there a TTL for the current feature_view, also keep the rows where the `timestamp_field`
     is higher the the one provided minus the TTL
     - For each row, Join on the entity key and retrieve the `entity_row_unique_id` that has been
     computed previously
@@ -594,16 +788,16 @@ WITH entity_dataframe AS (
 
 {{ featureview.name }}__subquery AS (
     SELECT
-        {{ featureview.event_timestamp_column }} as event_timestamp,
+        {{ featureview.timestamp_field }} as event_timestamp,
         {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
         {{ featureview.entity_selections | join(', ')}}{% if featureview.entity_selections %},{% else %}{% endif %}
         {% for feature in featureview.features %}
             {{ feature }} as {% if full_feature_names %}{{ featureview.name }}__{{featureview.field_mapping.get(feature, feature)}}{% else %}{{ featureview.field_mapping.get(feature, feature) }}{% endif %}{% if loop.last %}{% else %}, {% endif %}
         {% endfor %}
     FROM {{ featureview.table_subquery }}
-    WHERE {{ featureview.event_timestamp_column }} <= '{{ featureview.max_event_timestamp }}'
+    WHERE {{ featureview.timestamp_field }} <= '{{ featureview.max_event_timestamp }}'
     {% if featureview.ttl == 0 %}{% else %}
-    AND {{ featureview.event_timestamp_column }} >= '{{ featureview.min_event_timestamp }}'
+    AND {{ featureview.timestamp_field }} >= '{{ featureview.min_event_timestamp }}'
     {% endif %}
 ),
 

@@ -27,6 +27,7 @@ from typing import (
     Union,
 )
 
+import pytz
 from google.protobuf.timestamp_pb2 import Timestamp
 from pydantic import StrictStr
 from pydantic.typing import Literal
@@ -41,7 +42,7 @@ from feast.usage import log_exceptions_and_usage, tracing_span
 
 try:
     from redis import Redis
-    from redis.cluster import RedisCluster
+    from redis.cluster import ClusterNode, RedisCluster
 except ImportError as e:
     from feast.errors import FeastExtrasDependencyImportError
 
@@ -68,6 +69,9 @@ class RedisOnlineStoreConfig(FeastConfigBaseModel):
     """Connection string containing the host, port, and configuration parameters for Redis
      format: host:port,parameter1,parameter2 eg. redis:6379,db=0 """
 
+    key_ttl_seconds: Optional[int] = None
+    """(Optional) redis key bin ttl (in seconds) for expiring entities"""
+
 
 class RedisOnlineStore(OnlineStore):
     _client: Optional[Union[Redis, RedisCluster]] = None
@@ -75,7 +79,7 @@ class RedisOnlineStore(OnlineStore):
     def delete_entity_values(self, config: RepoConfig, join_keys: List[str]):
         client = self._get_client(config.online_store)
         deleted_count = 0
-        pipeline = client.pipeline()
+        pipeline = client.pipeline(transaction=False)
         prefix = _redis_key_prefix(join_keys)
 
         for _k in client.scan_iter(
@@ -102,9 +106,9 @@ class RedisOnlineStore(OnlineStore):
         (usually this happens when the last feature view that was using specific compound key is deleted)
         and remove all features attached to this "join_keys".
         """
-        join_keys_to_keep = set(tuple(table.entities) for table in tables_to_keep)
+        join_keys_to_keep = set(tuple(table.join_keys) for table in tables_to_keep)
 
-        join_keys_to_delete = set(tuple(table.entities) for table in tables_to_delete)
+        join_keys_to_delete = set(tuple(table.join_keys) for table in tables_to_delete)
 
         for join_keys in join_keys_to_delete - join_keys_to_keep:
             self.delete_entity_values(config, list(join_keys))
@@ -118,7 +122,7 @@ class RedisOnlineStore(OnlineStore):
         """
         We delete the keys in redis for tables/views being removed.
         """
-        join_keys_to_delete = set(tuple(table.entities) for table in tables)
+        join_keys_to_delete = set(tuple(table.join_keys) for table in tables)
 
         for join_keys in join_keys_to_delete:
             self.delete_entity_values(config, list(join_keys))
@@ -128,7 +132,7 @@ class RedisOnlineStore(OnlineStore):
         """
         Reads Redis connections string using format
         for RedisCluster:
-            redis1:6379,redis2:6379,decode_responses=true,skip_full_coverage_check=true,ssl=true,password=...
+            redis1:6379,redis2:6379,skip_full_coverage_check=true,ssl=true,password=...
         for Redis:
             redis_master:6379,db=0,ssl=true,password=...
         """
@@ -160,7 +164,9 @@ class RedisOnlineStore(OnlineStore):
                 online_store_config.connection_string
             )
             if online_store_config.redis_type == RedisType.redis_cluster:
-                kwargs["startup_nodes"] = startup_nodes
+                kwargs["startup_nodes"] = [
+                    ClusterNode(**node) for node in startup_nodes
+                ]
                 self._client = RedisCluster(**kwargs)
             else:
                 kwargs["host"] = startup_nodes[0]["host"]
@@ -188,12 +194,16 @@ class RedisOnlineStore(OnlineStore):
         ts_key = f"_ts:{feature_view}"
         keys = []
         # redis pipelining optimization: send multiple commands to redis server without waiting for every reply
-        with client.pipeline() as pipe:
+        with client.pipeline(transaction=False) as pipe:
             # check if a previous record under the key bin exists
             # TODO: investigate if check and set is a better approach rather than pulling all entity ts and then setting
             # it may be significantly slower but avoids potential (rare) race conditions
             for entity_key, _, _, _ in data:
-                redis_key_bin = _redis_key(project, entity_key)
+                redis_key_bin = _redis_key(
+                    project,
+                    entity_key,
+                    entity_key_serialization_version=config.entity_key_serialization_version,
+                )
                 keys.append(redis_key_bin)
                 pipe.hmget(redis_key_bin, ts_key)
             prev_event_timestamps = pipe.execute()
@@ -225,9 +235,11 @@ class RedisOnlineStore(OnlineStore):
                     entity_hset[f_key] = val.SerializeToString()
 
                 pipe.hset(redis_key_bin, mapping=entity_hset)
-                # TODO: support expiring the entity / features in Redis
-                # otherwise entity features remain in redis until cleaned up in separate process
-                # client.expire redis_key_bin based a ttl setting
+
+                if online_store_config.key_ttl_seconds:
+                    pipe.expire(
+                        name=redis_key_bin, time=online_store_config.key_ttl_seconds
+                    )
             results = pipe.execute()
             if progress:
                 progress(len(results))
@@ -260,9 +272,13 @@ class RedisOnlineStore(OnlineStore):
 
         keys = []
         for entity_key in entity_keys:
-            redis_key_bin = _redis_key(project, entity_key)
+            redis_key_bin = _redis_key(
+                project,
+                entity_key,
+                entity_key_serialization_version=config.entity_key_serialization_version,
+            )
             keys.append(redis_key_bin)
-        with client.pipeline() as pipe:
+        with client.pipeline(transaction=False) as pipe:
             for redis_key_bin in keys:
                 pipe.hmget(redis_key_bin, hset_keys)
             with tracing_span(name="remote_call"):
@@ -297,5 +313,5 @@ class RedisOnlineStore(OnlineStore):
         if not res:
             return None, None
         else:
-            timestamp = datetime.fromtimestamp(res_ts.seconds)
+            timestamp = datetime.fromtimestamp(res_ts.seconds, tz=pytz.utc)
             return timestamp, res
