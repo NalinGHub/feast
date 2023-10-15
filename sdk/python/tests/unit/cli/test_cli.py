@@ -1,7 +1,9 @@
+import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from textwrap import dedent
+from unittest import mock
 
 from assertpy import assertpy
 
@@ -85,6 +87,21 @@ def test_3rd_party_registry_store_with_fs_yaml_override() -> None:
         assertpy.assert_that(return_code).is_equal_to(0)
 
 
+def test_3rd_party_registry_store_with_fs_yaml_override_by_env_var() -> None:
+    runner = CliRunner()
+
+    fs_yaml_file = "test_fs.yaml"
+    with setup_third_party_registry_store_repo(
+        "foo.registry_store.FooRegistryStore", fs_yaml_file_name=fs_yaml_file
+    ) as repo_path:
+        custom_yaml_path = os.path.join(repo_path, fs_yaml_file)
+        with mock.patch.dict(
+            "os.environ", {"FEAST_FS_YAML_FILE_PATH": custom_yaml_path}, clear=True
+        ):
+            return_code, output = runner.run_with_output(["apply"], cwd=repo_path)
+            assertpy.assert_that(return_code).is_equal_to(0)
+
+
 @contextmanager
 def setup_third_party_provider_repo(provider_name: str):
     with tempfile.TemporaryDirectory() as repo_dir_name:
@@ -105,6 +122,7 @@ def setup_third_party_provider_repo(provider_name: str):
             type: sqlite
         offline_store:
             type: file
+        entity_key_serialization_version: 2
         """
             )
         )
@@ -142,6 +160,7 @@ def setup_third_party_registry_store_repo(
             type: sqlite
         offline_store:
             type: file
+        entity_key_serialization_version: 2
         """
             )
         )

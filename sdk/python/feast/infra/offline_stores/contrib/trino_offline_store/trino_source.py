@@ -97,6 +97,27 @@ class TrinoSource(DataSource):
         tags: Optional[Dict[str, str]] = None,
         owner: Optional[str] = "",
     ):
+        """
+        Creates a TrinoSource object.
+
+        Args:
+            name (optional): Name for the source. Defaults to the table if not specified, in which
+                case the table must be specified.
+            timestamp_field (optional): Event timestamp field used for point in time
+                joins of feature values.
+            table (optional): Trino table where the features are stored. Exactly one of 'table' and
+                'query' must be specified.
+            created_timestamp_column (optional): Timestamp column indicating when the
+                row was created, used for deduplicating rows.
+            field_mapping (optional): A dictionary mapping of column names in this data
+                source to column names in a feature table or view.
+            query (optional): The query to be executed to obtain the features. Exactly one of 'table'
+                and 'query' must be specified.
+            description (optional): A human-readable description.
+            tags (optional): A dictionary of key-value pairs to store arbitrary metadata.
+            owner (optional): The owner of the snowflake source, typically the email of the primary
+                maintainer.
+        """
         # If no name, use the table as the default name.
         if name is None and table is None:
             raise DataSourceNoNameException()
@@ -206,11 +227,20 @@ class TrinoSource(DataSource):
     def get_table_column_names_and_types(
         self, config: RepoConfig
     ) -> Iterable[Tuple[str, str]]:
+        auth = None
+        if config.offline_store.auth is not None:
+            auth = config.offline_store.auth.to_trino_auth()
+
         client = Trino(
-            user="user",
             catalog=config.offline_store.catalog,
             host=config.offline_store.host,
             port=config.offline_store.port,
+            user=config.offline_store.user,
+            source=config.offline_store.source,
+            http_scheme=config.offline_store.http_scheme,
+            verify=config.offline_store.verify,
+            extra_credential=config.offline_store.extra_credential,
+            auth=auth,
         )
         if self.table:
             table_schema = client.execute_query(

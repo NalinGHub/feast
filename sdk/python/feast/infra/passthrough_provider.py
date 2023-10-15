@@ -11,9 +11,10 @@ from feast.entity import Entity
 from feast.feature_logging import FeatureServiceLoggingSource
 from feast.feature_service import FeatureService
 from feast.feature_view import FeatureView
-from feast.infra.materialization import BatchMaterializationEngine, MaterializationTask
 from feast.infra.materialization.batch_materialization_engine import (
+    BatchMaterializationEngine,
     MaterializationJobStatus,
+    MaterializationTask,
 )
 from feast.infra.offline_stores.offline_store import RetrievalJob
 from feast.infra.offline_stores.offline_utils import get_offline_store_from_config
@@ -192,7 +193,6 @@ class PassthroughProvider(Provider):
     def ingest_df(
         self,
         feature_view: FeatureView,
-        entities: List[Entity],
         df: pd.DataFrame,
     ):
         set_usage_attribute("provider", self.__class__.__name__)
@@ -203,7 +203,10 @@ class PassthroughProvider(Provider):
                 table, feature_view.batch_source.field_mapping
             )
 
-        join_keys = {entity.join_key: entity.value_type for entity in entities}
+        join_keys = {
+            entity.name: entity.dtype.to_value_type()
+            for entity in feature_view.entity_columns
+        }
         rows_to_write = _convert_arrow_to_proto(table, feature_view, join_keys)
 
         self.online_write_batch(

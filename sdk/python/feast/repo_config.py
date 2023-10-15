@@ -15,7 +15,7 @@ from pydantic import (
     validator,
 )
 from pydantic.error_wrappers import ErrorWrapper
-from pydantic.typing import Dict, Optional, Union
+from pydantic.typing import Dict, Optional
 
 from feast.errors import (
     FeastFeatureServerTypeInvalidError,
@@ -23,6 +23,8 @@ from feast.errors import (
     FeastOfflineStoreInvalidName,
     FeastOnlineStoreInvalidName,
     FeastProviderNotSetError,
+    FeastRegistryNotSetError,
+    FeastRegistryTypeInvalidError,
 )
 from feast.importer import import_class
 from feast.usage import log_exceptions
@@ -34,11 +36,18 @@ _logger = logging.getLogger(__name__)
 # These dict exists so that:
 # - existing values for the online store type in featurestore.yaml files continue to work in a backwards compatible way
 # - first party and third party implementations can use the same class loading code path.
+REGISTRY_CLASS_FOR_TYPE = {
+    "file": "feast.infra.registry.registry.Registry",
+    "sql": "feast.infra.registry.sql.SqlRegistry",
+    "snowflake.registry": "feast.infra.registry.snowflake.SnowflakeRegistry",
+}
+
 BATCH_ENGINE_CLASS_FOR_TYPE = {
-    "local": "feast.infra.materialization.LocalMaterializationEngine",
+    "local": "feast.infra.materialization.local_engine.LocalMaterializationEngine",
     "snowflake.engine": "feast.infra.materialization.snowflake_engine.SnowflakeMaterializationEngine",
-    "lambda": "feast.infra.materialization.lambda.lambda_engine.LambdaMaterializationEngine",
+    "lambda": "feast.infra.materialization.aws_lambda.lambda_engine.LambdaMaterializationEngine",
     "bytewax": "feast.infra.materialization.contrib.bytewax.bytewax_materialization_engine.BytewaxMaterializationEngine",
+    "spark.engine": "feast.infra.materialization.contrib.spark.spark_materialization_engine.SparkMaterializationEngine",
 }
 
 ONLINE_STORE_CLASS_FOR_TYPE = {
@@ -47,9 +56,13 @@ ONLINE_STORE_CLASS_FOR_TYPE = {
     "redis": "feast.infra.online_stores.redis.RedisOnlineStore",
     "dynamodb": "feast.infra.online_stores.dynamodb.DynamoDBOnlineStore",
     "snowflake.online": "feast.infra.online_stores.snowflake.SnowflakeOnlineStore",
+    "bigtable": "feast.infra.online_stores.bigtable.BigtableOnlineStore",
     "postgres": "feast.infra.online_stores.contrib.postgres.PostgreSQLOnlineStore",
     "hbase": "feast.infra.online_stores.contrib.hbase_online_store.hbase.HbaseOnlineStore",
     "cassandra": "feast.infra.online_stores.contrib.cassandra_online_store.cassandra_online_store.CassandraOnlineStore",
+    "mysql": "feast.infra.online_stores.contrib.mysql_online_store.mysql.MySQLOnlineStore",
+    "rockset": "feast.infra.online_stores.contrib.rockset_online_store.rockset.RocksetOnlineStore",
+    "hazelcast": "feast.infra.online_stores.contrib.hazelcast_online_store.hazelcast_online_store.HazelcastOnlineStore",
 }
 
 OFFLINE_STORE_CLASS_FOR_TYPE = {
@@ -61,6 +74,7 @@ OFFLINE_STORE_CLASS_FOR_TYPE = {
     "trino": "feast.infra.offline_stores.contrib.trino_offline_store.trino.TrinoOfflineStore",
     "postgres": "feast.infra.offline_stores.contrib.postgres_offline_store.postgres.PostgreSQLOfflineStore",
     "athena": "feast.infra.offline_stores.contrib.athena_offline_store.athena.AthenaOfflineStore",
+    "mssql": "feast.infra.offline_stores.contrib.mssql_offline_store.mssql.MsSqlServerOfflineStore",
 }
 
 FEATURE_SERVER_CONFIG_CLASS_FOR_TYPE = {
@@ -96,14 +110,15 @@ class RegistryConfig(FeastBaseModel):
     """Metadata Store Configuration. Configuration that relates to reading from and writing to the Feast registry."""
 
     registry_type: StrictStr = "file"
-    """ str: Provider name or a class name that implements RegistryStore.
-        If specified, registry_store_type should be redundant."""
+    """ str: Provider name or a class name that implements Registry."""
 
     registry_store_type: Optional[StrictStr]
     """ str: Provider name or a class name that implements RegistryStore. """
 
-    path: StrictStr
-    """ str: Path to metadata store. Can be a local path, or remote object storage path, e.g. a GCS URI """
+    path: StrictStr = ""
+    """ str: Path to metadata store.
+        If registry_type is 'file', then an be a local path, or remote object storage path, e.g. a GCS URI
+        If registry_type is 'sql', then this is a database URL as expected by SQLAlchemy """
 
     cache_ttl_seconds: StrictInt = 600
     """int: The cache TTL is the amount of time registry state will be cached in memory. If this TTL is exceeded then
@@ -111,12 +126,12 @@ class RegistryConfig(FeastBaseModel):
      set to infinity by setting TTL to 0 seconds, which means the cache will only be loaded once and will never
      expire. Users can manually refresh the cache by calling feature_store.refresh_registry() """
 
+    s3_additional_kwargs: Optional[Dict[str, str]]
+    """ Dict[str, str]: Extra arguments to pass to boto3 when writing the registry file to S3. """
+
 
 class RepoConfig(FeastBaseModel):
     """Repo config. Typically loaded from `feature_store.yaml`"""
-
-    registry: Union[StrictStr, RegistryConfig] = "data/registry.db"
-    """ str: Path to metadata store. Can be a local path, or remote object storage path, e.g. a GCS URI """
 
     project: StrictStr
     """ str: Feast project id. This can be any alphanumeric string up to 16 characters.
@@ -126,6 +141,14 @@ class RepoConfig(FeastBaseModel):
 
     provider: StrictStr
     """ str: local or gcp or aws """
+
+    _registry_config: Any = Field(alias="registry", default="data/registry.db")
+    """ Configures the registry.
+        Can be:
+            1. str: a path to a file based registry (a local path, or remote object storage path, e.g. a GCS URI)
+            2. RegistryConfig: A fully specified file based registry or SQL based registry
+            3. SnowflakeRegistryConfig: Using a Snowflake table to store the registry
+    """
 
     _online_config: Any = Field(alias="online_store")
     """ OnlineStoreConfig: Online store configuration (optional depending on provider) """
@@ -144,12 +167,6 @@ class RepoConfig(FeastBaseModel):
 
     repo_path: Optional[Path] = None
 
-    go_feature_serving: Optional[bool] = False
-    """ If True, use the Go feature server instead of the Python feature server. """
-
-    go_feature_retrieval: Optional[bool] = False
-    """ If True, use the embedded Go code to retrieve features instead of the Python SDK. """
-
     entity_key_serialization_version: StrictInt = 1
     """ Entity key serialization version: This version is used to control what serialization scheme is
     used when writing data to the online store.
@@ -161,8 +178,16 @@ class RepoConfig(FeastBaseModel):
     feature values for entities that have already been written into the online store.
     """
 
+    coerce_tz_aware: Optional[bool] = True
+    """ If True, coerces entity_df timestamp columns to be timezone aware (to UTC by default). """
+
     def __init__(self, **data: Any):
         super().__init__(**data)
+
+        self._registry = None
+        if "registry" not in data:
+            raise FeastRegistryNotSetError()
+        self._registry_config = data["registry"]
 
         self._offline_store = None
         if "offline_store" in data:
@@ -174,6 +199,8 @@ class RepoConfig(FeastBaseModel):
                 self._offline_config = "bigquery"
             elif data["provider"] == "aws":
                 self._offline_config = "redshift"
+            elif data["provider"] == "azure":
+                self._offline_config = "mssql"
 
         self._online_store = None
         if "online_store" in data:
@@ -185,14 +212,14 @@ class RepoConfig(FeastBaseModel):
                 self._online_config = "datastore"
             elif data["provider"] == "aws":
                 self._online_config = "dynamodb"
+            elif data["provider"] == "rockset":
+                self._online_config = "rockset"
 
         self._batch_engine = None
         if "batch_engine" in data:
             self._batch_engine_config = data["batch_engine"]
         elif "batch_engine_config" in data:
             self._batch_engine_config = data["batch_engine_config"]
-        elif self._offline_config == "snowflake.offline":
-            self._batch_engine_config = "snowflake.engine"
         else:
             # Defaults to using local in-process materialization engine.
             self._batch_engine_config = "local"
@@ -212,11 +239,25 @@ class RepoConfig(FeastBaseModel):
                 RuntimeWarning,
             )
 
-    def get_registry_config(self):
-        if isinstance(self.registry, str):
-            return RegistryConfig(path=self.registry)
-        else:
-            return self.registry
+    @property
+    def registry(self):
+        if not self._registry:
+            if isinstance(self._registry_config, Dict):
+                if "registry_type" in self._registry_config:
+                    self._registry = get_registry_config_from_type(
+                        self._registry_config["registry_type"]
+                    )(**self._registry_config)
+                else:
+                    # This may be a custom registry store, which does not need a 'registry_type'
+                    self._registry = RegistryConfig(**self._registry_config)
+            elif isinstance(self._registry_config, str):
+                # User passed in just a path to file registry
+                self._registry = get_registry_config_from_type("file")(
+                    path=self._registry_config
+                )
+            elif self._registry_config:
+                self._registry = self._registry_config
+        return self._registry
 
     @property
     def offline_store(self):
@@ -334,6 +375,8 @@ class RepoConfig(FeastBaseModel):
                 values["offline_store"]["type"] = "bigquery"
             elif values["provider"] == "aws":
                 values["offline_store"]["type"] = "redshift"
+            if values["provider"] == "azure":
+                values["offline_store"]["type"] = "mssql"
 
         offline_store_type = values["offline_store"]["type"]
 
@@ -442,6 +485,16 @@ class FeastConfigError(Exception):
 def get_data_source_class_from_type(data_source_type: str):
     module_name, config_class_name = data_source_type.rsplit(".", 1)
     return import_class(module_name, config_class_name, "DataSource")
+
+
+def get_registry_config_from_type(registry_type: str):
+    # We do not support custom registry's right now
+    if registry_type not in REGISTRY_CLASS_FOR_TYPE:
+        raise FeastRegistryTypeInvalidError(registry_type)
+    registry_type = REGISTRY_CLASS_FOR_TYPE[registry_type]
+    module_name, registry_class_type = registry_type.rsplit(".", 1)
+    config_class_name = f"{registry_class_type}Config"
+    return import_class(module_name, config_class_name, config_class_name)
 
 
 def get_batch_engine_config_from_type(batch_engine_type: str):

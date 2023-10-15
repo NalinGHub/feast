@@ -1,18 +1,21 @@
 import json
 import traceback
 import warnings
+from typing import List, Optional
 
+import gunicorn.app.base
 import pandas as pd
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from dateutil import parser
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.logger import logger
 from fastapi.params import Depends
 from google.protobuf.json_format import MessageToDict, Parse
 from pydantic import BaseModel
 
 import feast
-from feast import proto_json
+from feast import proto_json, utils
 from feast.data_source import PushMode
+from feast.errors import PushSourceNotFoundException
 from feast.protos.feast.serving.ServingService_pb2 import GetOnlineFeaturesRequest
 
 
@@ -28,6 +31,17 @@ class PushFeaturesRequest(BaseModel):
     df: dict
     allow_registry_cache: bool = True
     to: str = "online"
+
+
+class MaterializeRequest(BaseModel):
+    start_ts: str
+    end_ts: str
+    feature_views: Optional[List[str]] = None
+
+
+class MaterializeIncrementalRequest(BaseModel):
+    end_ts: str
+    feature_views: Optional[List[str]] = None
 
 
 def get_app(store: "feast.FeatureStore"):
@@ -98,6 +112,11 @@ def get_app(store: "feast.FeatureStore"):
                 allow_registry_cache=request.allow_registry_cache,
                 to=to,
             )
+        except PushSourceNotFoundException as e:
+            # Print the original exception on the server side
+            logger.exception(traceback.format_exc())
+            # Raise HTTPException to return the error message to the client
+            raise HTTPException(status_code=422, detail=str(e))
         except Exception as e:
             # Print the original exception on the server side
             logger.exception(traceback.format_exc())
@@ -124,11 +143,70 @@ def get_app(store: "feast.FeatureStore"):
             # Raise HTTPException to return the error message to the client
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/health")
+    def health():
+        return Response(status_code=status.HTTP_200_OK)
+
+    @app.post("/materialize")
+    def materialize(body=Depends(get_body)):
+        try:
+            request = MaterializeRequest(**json.loads(body))
+            store.materialize(
+                utils.make_tzaware(parser.parse(request.start_ts)),
+                utils.make_tzaware(parser.parse(request.end_ts)),
+                request.feature_views,
+            )
+        except Exception as e:
+            # Print the original exception on the server side
+            logger.exception(traceback.format_exc())
+            # Raise HTTPException to return the error message to the client
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/materialize-incremental")
+    def materialize_incremental(body=Depends(get_body)):
+        try:
+            request = MaterializeIncrementalRequest(**json.loads(body))
+            store.materialize_incremental(
+                utils.make_tzaware(parser.parse(request.end_ts)), request.feature_views
+            )
+        except Exception as e:
+            # Print the original exception on the server side
+            logger.exception(traceback.format_exc())
+            # Raise HTTPException to return the error message to the client
+            raise HTTPException(status_code=500, detail=str(e))
+
     return app
 
 
+class FeastServeApplication(gunicorn.app.base.BaseApplication):
+    def __init__(self, store: "feast.FeatureStore", **options):
+        self._app = get_app(store=store)
+        self._options = options
+        super().__init__()
+
+    def load_config(self):
+        for key, value in self._options.items():
+            if key.lower() in self.cfg.settings and value is not None:
+                self.cfg.set(key.lower(), value)
+
+        self.cfg.set("worker_class", "uvicorn.workers.UvicornWorker")
+
+    def load(self):
+        return self._app
+
+
 def start_server(
-    store: "feast.FeatureStore", host: str, port: int, no_access_log: bool
+    store: "feast.FeatureStore",
+    host: str,
+    port: int,
+    no_access_log: bool,
+    workers: int,
+    keep_alive_timeout: int,
 ):
-    app = get_app(store)
-    uvicorn.run(app, host=host, port=port, access_log=(not no_access_log))
+    FeastServeApplication(
+        store=store,
+        bind=f"{host}:{port}",
+        accesslog=None if no_access_log else "-",
+        workers=workers,
+        keepalive=keep_alive_timeout,
+    ).run()

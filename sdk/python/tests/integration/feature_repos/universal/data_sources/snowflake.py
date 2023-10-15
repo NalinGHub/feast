@@ -12,7 +12,11 @@ from feast.infra.offline_stores.snowflake_source import (
     SavedDatasetSnowflakeStorage,
     SnowflakeLoggingDestination,
 )
-from feast.infra.utils.snowflake.snowflake_utils import get_snowflake_conn, write_pandas
+from feast.infra.utils.snowflake.snowflake_utils import (
+    GetSnowflakeConnection,
+    execute_snowflake_statement,
+    write_pandas,
+)
 from feast.repo_config import FeastConfigBaseModel
 from tests.integration.feature_repos.universal.data_source_creator import (
     DataSourceCreator,
@@ -50,11 +54,10 @@ class SnowflakeDataSourceCreator(DataSourceCreator):
         field_mapping: Dict[str, str] = None,
     ) -> DataSource:
 
-        snowflake_conn = get_snowflake_conn(self.offline_store_config)
-
         destination_name = self.get_prefixed_table_name(destination_name)
 
-        write_pandas(snowflake_conn, df, destination_name, auto_create_table=True)
+        with GetSnowflakeConnection(self.offline_store_config) as conn:
+            write_pandas(conn, df, destination_name, auto_create_table=True)
 
         self.tables.append(destination_name)
 
@@ -63,7 +66,6 @@ class SnowflakeDataSourceCreator(DataSourceCreator):
             timestamp_field=timestamp_field,
             created_timestamp_column=created_timestamp_column,
             field_mapping=field_mapping or {"ts_1": "ts"},
-            warehouse=self.offline_store_config.warehouse,
         )
 
     def create_saved_dataset_destination(self) -> SavedDatasetSnowflakeStorage:
@@ -89,9 +91,7 @@ class SnowflakeDataSourceCreator(DataSourceCreator):
         return f"{self.project_name}_{suffix}"
 
     def teardown(self):
-        snowflake_conn = get_snowflake_conn(self.offline_store_config)
-
-        with snowflake_conn as conn:
-            cur = conn.cursor()
+        with GetSnowflakeConnection(self.offline_store_config) as conn:
             for table in self.tables:
-                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+                query = f'DROP TABLE IF EXISTS "{table}"'
+                execute_snowflake_statement(conn, query)

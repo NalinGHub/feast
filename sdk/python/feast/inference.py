@@ -1,5 +1,5 @@
 import re
-from typing import List, Set, Union
+from typing import List, Optional, Set, Union
 
 from feast.data_source import DataSource, PushSource, RequestSource
 from feast.entity import Entity
@@ -7,6 +7,9 @@ from feast.errors import RegistryInferenceFailure
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_NAME, FeatureView
 from feast.field import Field, from_value_type
 from feast.infra.offline_stores.bigquery_source import BigQuerySource
+from feast.infra.offline_stores.contrib.mssql_offline_store.mssqlserver_source import (
+    MsSqlServerSource,
+)
 from feast.infra.offline_stores.file_source import FileSource
 from feast.infra.offline_stores.redshift_source import RedshiftSource
 from feast.infra.offline_stores.snowflake_source import SnowflakeSource
@@ -40,12 +43,14 @@ def update_data_sources_with_inferred_event_timestamp_col(
                 ts_column_type_regex_pattern = "TIMESTAMP[A-Z]*"
             elif isinstance(data_source, SnowflakeSource):
                 ts_column_type_regex_pattern = "TIMESTAMP_[A-Z]*"
+            elif isinstance(data_source, MsSqlServerSource):
+                ts_column_type_regex_pattern = "TIMESTAMP|DATETIME"
             else:
                 raise RegistryInferenceFailure(
                     "DataSource",
                     f"""
                     DataSource inferencing of timestamp_field is currently only supported
-                    for FileSource, SparkSource, BigQuerySource, RedshiftSource, and SnowflakeSource.
+                    for FileSource, SparkSource, BigQuerySource, RedshiftSource, SnowflakeSource, MsSqlSource.
                     Attempting to infer from {data_source}.
                     """,
                 )
@@ -55,6 +60,7 @@ def update_data_sources_with_inferred_event_timestamp_col(
                 or isinstance(data_source, BigQuerySource)
                 or isinstance(data_source, RedshiftSource)
                 or isinstance(data_source, SnowflakeSource)
+                or isinstance(data_source, MsSqlServerSource)
                 or "SparkSource" == data_source.__class__.__name__
             )
 
@@ -109,14 +115,13 @@ def update_feature_views_with_inferred_features_and_entities(
         config: The config for the current feature store.
     """
     entity_name_to_entity_map = {e.name: e for e in entities}
-    entity_name_to_join_keys_map = {e.name: e.join_keys for e in entities}
+    entity_name_to_join_key_map = {e.name: e.join_key for e in entities}
 
     for fv in fvs:
         join_keys = set(
             [
-                join_key
+                entity_name_to_join_key_map.get(entity_name)
                 for entity_name in fv.entities
-                for join_key in entity_name_to_join_keys_map[entity_name]
             ]
         )
 
@@ -133,10 +138,12 @@ def update_feature_views_with_inferred_features_and_entities(
                 if field.name not in [feature.name for feature in fv.features]:
                     fv.features.append(field)
 
-        # Since the `value_type` parameter has not yet been fully deprecated for
-        # entities, we respect the `value_type` attribute if it still exists.
+        # Respect the `value_type` attribute of the entity, if it is specified.
         for entity_name in fv.entities:
-            entity = entity_name_to_entity_map[entity_name]
+            entity = entity_name_to_entity_map.get(entity_name)
+            # pass when entity does not exist. Entityless feature view case
+            if entity is None:
+                continue
             if (
                 entity.join_key
                 not in [entity_column.name for entity_column in fv.entity_columns]
@@ -150,17 +157,15 @@ def update_feature_views_with_inferred_features_and_entities(
                 )
 
         # Infer a dummy entity column for entityless feature views.
-        if len(fv.entities) == 1 and fv.entities[0] == DUMMY_ENTITY_NAME:
+        if (
+            len(fv.entities) == 1
+            and fv.entities[0] == DUMMY_ENTITY_NAME
+            and not fv.entity_columns
+        ):
             fv.entity_columns.append(Field(name=DUMMY_ENTITY_ID, dtype=String))
 
         # Run inference for entity columns if there are fewer entity fields than expected.
-        num_expected_join_keys = sum(
-            [
-                len(entity_name_to_join_keys_map[entity_name])
-                for entity_name in fv.entities
-            ]
-        )
-        run_inference_for_entities = len(fv.entity_columns) < num_expected_join_keys
+        run_inference_for_entities = len(fv.entity_columns) < len(join_keys)
 
         # Run inference for feature columns if there are no feature fields.
         run_inference_for_features = len(fv.features) == 0
@@ -182,7 +187,7 @@ def update_feature_views_with_inferred_features_and_entities(
 
 def _infer_features_and_entities(
     fv: FeatureView,
-    join_keys: Set[str],
+    join_keys: Set[Optional[str]],
     run_inference_for_features,
     config,
 ) -> None:

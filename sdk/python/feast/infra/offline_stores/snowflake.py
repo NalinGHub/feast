@@ -1,9 +1,12 @@
 import contextlib
 import os
 import uuid
+import warnings
 from datetime import datetime
+from functools import reduce
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ContextManager,
@@ -19,14 +22,13 @@ from typing import (
 import numpy as np
 import pandas as pd
 import pyarrow
-import pyarrow as pa
 from pydantic import Field, StrictStr
 from pydantic.typing import Literal
 from pytz import utc
 
 from feast import OnDemandFeatureView
 from feast.data_source import DataSource
-from feast.errors import InvalidEntityType
+from feast.errors import EntitySQLEmptyResults, InvalidEntityType
 from feast.feature_logging import LoggingConfig, LoggingSource
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL, FeatureView
 from feast.infra.offline_stores import offline_utils
@@ -42,8 +44,8 @@ from feast.infra.offline_stores.snowflake_source import (
 )
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.infra.utils.snowflake.snowflake_utils import (
+    GetSnowflakeConnection,
     execute_snowflake_statement,
-    get_snowflake_conn,
     write_pandas,
     write_parquet,
 )
@@ -58,20 +60,23 @@ except ImportError as e:
 
     raise FeastExtrasDependencyImportError("snowflake", str(e))
 
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 class SnowflakeOfflineStoreConfig(FeastConfigBaseModel):
     """Offline store config for Snowflake"""
 
     type: Literal["snowflake.offline"] = "snowflake.offline"
-    """ Offline store type selector"""
+    """ Offline store type selector """
 
-    config_path: Optional[str] = (
-        Path(os.environ["HOME"]) / ".snowsql/config"
-    ).__str__()
+    config_path: Optional[str] = os.path.expanduser("~/.snowsql/config")
     """ Snowflake config path -- absolute path required (Cant use ~)"""
 
     account: Optional[str] = None
-    """ Snowflake deployment identifier -- drop .snowflakecomputing.com"""
+    """ Snowflake deployment identifier -- drop .snowflakecomputing.com """
 
     user: Optional[str] = None
     """ Snowflake user name """
@@ -80,7 +85,7 @@ class SnowflakeOfflineStoreConfig(FeastConfigBaseModel):
     """ Snowflake password """
 
     role: Optional[str] = None
-    """ Snowflake role name"""
+    """ Snowflake role name """
 
     warehouse: Optional[str] = None
     """ Snowflake warehouse name """
@@ -99,6 +104,9 @@ class SnowflakeOfflineStoreConfig(FeastConfigBaseModel):
 
     blob_export_location: Optional[str] = None
     """ Location (in S3, Google storage or Azure storage) where data is offloaded """
+
+    convert_timestamp_columns: Optional[bool] = None
+    """ Convert timestamp columns on export to a Parquet-supported format """
 
     class Config:
         allow_population_by_field_name = True
@@ -143,10 +151,31 @@ class SnowflakeOfflineStore(OfflineStore):
             + '"'
         )
 
-        if data_source.snowflake_options.warehouse:
-            config.offline_store.warehouse = data_source.snowflake_options.warehouse
+        if config.offline_store.convert_timestamp_columns:
+            select_fields = list(
+                map(
+                    lambda field_name: f'"{field_name}"',
+                    join_key_columns + feature_name_columns,
+                )
+            )
+            select_timestamps = list(
+                map(
+                    lambda field_name: f"TO_VARCHAR({field_name}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FFTZH:TZM') AS {field_name}",
+                    timestamp_columns,
+                )
+            )
+            inner_field_string = ", ".join(select_fields + select_timestamps)
+        else:
+            select_fields = list(
+                map(
+                    lambda field_name: f'"{field_name}"',
+                    join_key_columns + feature_name_columns + timestamp_columns,
+                )
+            )
+            inner_field_string = ", ".join(select_fields)
 
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            snowflake_conn = conn
 
         start_date = start_date.astimezone(tz=utc)
         end_date = end_date.astimezone(tz=utc)
@@ -156,7 +185,7 @@ class SnowflakeOfflineStore(OfflineStore):
                 {field_string}
                 {f''', TRIM({repr(DUMMY_ENTITY_VAL)}::VARIANT,'"') AS "{DUMMY_ENTITY_ID}"''' if not join_key_columns else ""}
             FROM (
-                SELECT {field_string},
+                SELECT {inner_field_string},
                 ROW_NUMBER() OVER({partition_by_join_key_string} ORDER BY {timestamp_desc_string}) AS "_feast_row"
                 FROM {from_expression}
                 WHERE "{timestamp_field}" BETWEEN TIMESTAMP '{start_date}' AND TIMESTAMP '{end_date}'
@@ -196,10 +225,8 @@ class SnowflakeOfflineStore(OfflineStore):
             + '"'
         )
 
-        if data_source.snowflake_options.warehouse:
-            config.offline_store.warehouse = data_source.snowflake_options.warehouse
-
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            snowflake_conn = conn
 
         start_date = start_date.astimezone(tz=utc)
         end_date = end_date.astimezone(tz=utc)
@@ -232,7 +259,8 @@ class SnowflakeOfflineStore(OfflineStore):
         for fv in feature_views:
             assert isinstance(fv.batch_source, SnowflakeSource)
 
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            snowflake_conn = conn
 
         entity_schema = _get_entity_schema(entity_df, snowflake_conn, config)
 
@@ -310,7 +338,8 @@ class SnowflakeOfflineStore(OfflineStore):
     ):
         assert isinstance(logging_config.destination, SnowflakeLoggingDestination)
 
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            snowflake_conn = conn
 
         if isinstance(data, Path):
             write_parquet(
@@ -350,7 +379,8 @@ class SnowflakeOfflineStore(OfflineStore):
         if table.schema != pa_schema:
             table = table.cast(pa_schema)
 
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            snowflake_conn = conn
 
         write_pandas(
             snowflake_conn,
@@ -401,47 +431,28 @@ class SnowflakeRetrievalJob(RetrievalJob):
     def on_demand_feature_views(self) -> List[OnDemandFeatureView]:
         return self._on_demand_feature_views
 
-    def _to_df_internal(self) -> pd.DataFrame:
-        with self._query_generator() as query:
-
-            df = execute_snowflake_statement(
-                self.snowflake_conn, query
-            ).fetch_pandas_all()
+    def _to_df_internal(self, timeout: Optional[int] = None) -> pd.DataFrame:
+        df = execute_snowflake_statement(
+            self.snowflake_conn, self.to_sql()
+        ).fetch_pandas_all()
 
         return df
 
-    def _to_arrow_internal(self) -> pa.Table:
-        with self._query_generator() as query:
+    def _to_arrow_internal(self, timeout: Optional[int] = None) -> pyarrow.Table:
+        pa_table = execute_snowflake_statement(
+            self.snowflake_conn, self.to_sql()
+        ).fetch_arrow_all()
 
-            pa_table = execute_snowflake_statement(
-                self.snowflake_conn, query
-            ).fetch_arrow_all()
-
-            if pa_table:
-
-                return pa_table
-            else:
-                empty_result = execute_snowflake_statement(self.snowflake_conn, query)
-
-                return pa.Table.from_pandas(
-                    pd.DataFrame(columns=[md.name for md in empty_result.description])
-                )
-
-    def to_snowflake(self, table_name: str, temporary=False) -> None:
-        """Save dataset as a new Snowflake table"""
-        if self.on_demand_feature_views:
-            transformed_df = self.to_df()
-
-            write_pandas(
-                self.snowflake_conn, transformed_df, table_name, auto_create_table=True
+        if pa_table:
+            return pa_table
+        else:
+            empty_result = execute_snowflake_statement(
+                self.snowflake_conn, self.to_sql()
             )
 
-            return None
-
-        with self._query_generator() as query:
-            query = f'CREATE {"TEMPORARY" if temporary else ""} TABLE IF NOT EXISTS "{table_name}" AS ({query});\n'
-
-            execute_snowflake_statement(self.snowflake_conn, query)
+            return pyarrow.Table.from_pandas(
+                pd.DataFrame(columns=[md.name for md in empty_result.description])
+            )
 
     def to_sql(self) -> str:
         """
@@ -450,18 +461,97 @@ class SnowflakeRetrievalJob(RetrievalJob):
         with self._query_generator() as query:
             return query
 
-    def to_arrow_chunks(self, arrow_options: Optional[Dict] = None) -> Optional[List]:
-        with self._query_generator() as query:
+    def to_snowflake(
+        self, table_name: str, allow_overwrite: bool = False, temporary: bool = False
+    ) -> None:
+        """Save dataset as a new Snowflake table"""
+        if self.on_demand_feature_views:
+            transformed_df = self.to_df()
 
-            arrow_batches = execute_snowflake_statement(
-                self.snowflake_conn, query
-            ).get_result_batches()
+            if allow_overwrite:
+                query = f'DROP TABLE IF EXISTS "{table_name}"'
+                execute_snowflake_statement(self.snowflake_conn, query)
+
+            write_pandas(
+                self.snowflake_conn,
+                transformed_df,
+                table_name,
+                auto_create_table=True,
+                create_temp_table=temporary,
+            )
+
+        else:
+            query = f'CREATE {"OR REPLACE" if allow_overwrite else ""} {"TEMPORARY" if temporary else ""} TABLE {"IF NOT EXISTS" if not allow_overwrite else ""} "{table_name}" AS ({self.to_sql()});\n'
+            execute_snowflake_statement(self.snowflake_conn, query)
+
+        return None
+
+    def to_arrow_batches(self) -> Iterator[pyarrow.Table]:
+
+        table_name = "temp_arrow_batches_" + uuid.uuid4().hex
+
+        self.to_snowflake(table_name=table_name, allow_overwrite=True, temporary=True)
+
+        query = f'SELECT * FROM "{table_name}"'
+        arrow_batches = execute_snowflake_statement(
+            self.snowflake_conn, query
+        ).fetch_arrow_batches()
 
         return arrow_batches
 
-    def persist(self, storage: SavedDatasetStorage, allow_overwrite: bool = False):
+    def to_pandas_batches(self) -> Iterator[pd.DataFrame]:
+
+        table_name = "temp_pandas_batches_" + uuid.uuid4().hex
+
+        self.to_snowflake(table_name=table_name, allow_overwrite=True, temporary=True)
+
+        query = f'SELECT * FROM "{table_name}"'
+        arrow_batches = execute_snowflake_statement(
+            self.snowflake_conn, query
+        ).fetch_pandas_batches()
+
+        return arrow_batches
+
+    def to_spark_df(self, spark_session: "SparkSession") -> "DataFrame":
+        """
+        Method to convert snowflake query results to pyspark data frame.
+
+        Args:
+            spark_session: spark Session variable of current environment.
+
+        Returns:
+            spark_df: A pyspark dataframe.
+        """
+
+        try:
+            from pyspark.sql import DataFrame
+        except ImportError as e:
+            from feast.errors import FeastExtrasDependencyImportError
+
+            raise FeastExtrasDependencyImportError("spark", str(e))
+
+        spark_session.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+
+        # This can be improved by parallelizing the read of chunks
+        pandas_batches = self.to_pandas_batches()
+
+        spark_df = reduce(
+            DataFrame.unionAll,
+            [spark_session.createDataFrame(batch) for batch in pandas_batches],
+        )
+        return spark_df
+
+    def persist(
+        self,
+        storage: SavedDatasetStorage,
+        allow_overwrite: bool = False,
+        timeout: Optional[int] = None,
+    ):
         assert isinstance(storage, SavedDatasetSnowflakeStorage)
-        self.to_snowflake(table_name=storage.snowflake_options.table)
+
+        self.to_snowflake(
+            table_name=storage.snowflake_options.table, allow_overwrite=allow_overwrite
+        )
 
     @property
     def metadata(self) -> Optional[RetrievalMetadata]:
@@ -484,23 +574,24 @@ class SnowflakeRetrievalJob(RetrievalJob):
             )
 
         table = f"temporary_{uuid.uuid4().hex}"
-        self.to_snowflake(table)
+        self.to_snowflake(table, temporary=True)
 
-        copy_into_query = f"""copy into '{self.config.offline_store.blob_export_location}/{table}' from "{self.config.offline_store.database}"."{self.config.offline_store.schema_}"."{table}"\n
-          storage_integration = {self.config.offline_store.storage_integration_name}\n
-          file_format = (TYPE = PARQUET)\n
-          DETAILED_OUTPUT = TRUE\n
-          HEADER = TRUE;\n
+        query = f"""
+            COPY INTO '{self.export_path}/{table}' FROM "{self.config.offline_store.database}"."{self.config.offline_store.schema_}"."{table}"\n
+              STORAGE_INTEGRATION = {self.config.offline_store.storage_integration_name}\n
+              FILE_FORMAT = (TYPE = PARQUET)
+              DETAILED_OUTPUT = TRUE
+              HEADER = TRUE
         """
+        cursor = execute_snowflake_statement(self.snowflake_conn, query)
 
-        cursor = execute_snowflake_statement(self.snowflake_conn, copy_into_query)
-        all_rows = (
-            cursor.fetchall()
-        )  # This may be need pagination at some point in the future.
         file_name_column_index = [
             idx for idx, rm in enumerate(cursor.description) if rm.name == "FILE_NAME"
         ][0]
-        return [f"{self.export_path}/{row[file_name_column_index]}" for row in all_rows]
+        return [
+            f"{self.export_path}/{row[file_name_column_index]}"
+            for row in cursor.fetchall()
+        ]
 
 
 def _get_entity_schema(
@@ -585,6 +676,11 @@ def _get_entity_df_event_timestamp_range(
         results = execute_snowflake_statement(snowflake_conn, query).fetchall()
 
         entity_df_event_timestamp_range = cast(Tuple[datetime, datetime], results[0])
+        if (
+            entity_df_event_timestamp_range[0] is None
+            or entity_df_event_timestamp_range[1] is None
+        ):
+            raise EntitySQLEmptyResults(entity_df)
     else:
         raise InvalidEntityType(type(entity_df))
 

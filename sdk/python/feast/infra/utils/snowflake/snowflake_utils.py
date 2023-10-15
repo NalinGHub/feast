@@ -39,6 +39,77 @@ getLogger("snowflake.connector.connection").disabled = True
 getLogger("snowflake.connector.network").disabled = True
 logger = getLogger(__name__)
 
+_cache = {}
+
+
+class GetSnowflakeConnection:
+    def __init__(self, config: str, autocommit=True):
+        self.config = config
+        self.autocommit = autocommit
+
+    def __enter__(self):
+
+        assert self.config.type in [
+            "snowflake.registry",
+            "snowflake.offline",
+            "snowflake.engine",
+            "snowflake.online",
+        ]
+
+        if self.config.type not in _cache:
+            if self.config.type == "snowflake.registry":
+                config_header = "connections.feast_registry"
+            elif self.config.type == "snowflake.offline":
+                config_header = "connections.feast_offline_store"
+            if self.config.type == "snowflake.engine":
+                config_header = "connections.feast_batch_engine"
+            elif self.config.type == "snowflake.online":
+                config_header = "connections.feast_online_store"
+
+            config_dict = dict(self.config)
+
+            # read config file
+            config_reader = configparser.ConfigParser()
+            config_reader.read([config_dict["config_path"]])
+            kwargs: Dict[str, Any] = {}
+            if config_reader.has_section(config_header):
+                kwargs = dict(config_reader[config_header])
+
+            kwargs.update((k, v) for k, v in config_dict.items() if v is not None)
+
+            for k, v in kwargs.items():
+                if k in ["role", "warehouse", "database", "schema_"]:
+                    kwargs[k] = f'"{v}"'
+
+            kwargs["schema"] = kwargs.pop("schema_")
+
+            # https://docs.snowflake.com/en/user-guide/python-connector-example.html#using-key-pair-authentication-key-pair-rotation
+            # https://docs.snowflake.com/en/user-guide/key-pair-auth.html#configuring-key-pair-authentication
+            if "private_key" in kwargs:
+                kwargs["private_key"] = parse_private_key_path(
+                    kwargs["private_key"], kwargs["private_key_passphrase"]
+                )
+
+            try:
+                _cache[self.config.type] = snowflake.connector.connect(
+                    application="feast",
+                    client_session_keep_alive=True,
+                    autocommit=self.autocommit,
+                    **kwargs,
+                )
+                _cache[self.config.type].cursor().execute(
+                    "ALTER SESSION SET TIMEZONE = 'UTC'", _is_internal=True
+                )
+
+            except KeyError as e:
+                raise SnowflakeIncompleteConfig(e)
+
+        self.client = _cache[self.config.type]
+        return self.client
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
 
 def assert_snowflake_feature_names(feature_view: FeatureView) -> None:
     for feature in feature_view.features:
@@ -57,65 +128,19 @@ def execute_snowflake_statement(conn: SnowflakeConnection, query) -> SnowflakeCu
     return cursor
 
 
-def get_snowflake_conn(config, autocommit=True) -> SnowflakeConnection:
-    assert config.type in ["snowflake.offline", "snowflake.engine", "snowflake.online"]
-
-    if config.type == "snowflake.offline":
-        config_header = "connections.feast_offline_store"
-    if config.type == "snowflake.engine":
-        config_header = "connections.feast_batch_engine"
-    elif config.type == "snowflake.online":
-        config_header = "connections.feast_online_store"
-
-    config_dict = dict(config)
-
-    # read config file
-    config_reader = configparser.ConfigParser()
-    config_reader.read([config_dict["config_path"]])
-    kwargs: Dict[str, Any] = {}
-    if config_reader.has_section(config_header):
-        kwargs = dict(config_reader[config_header])
-
-    kwargs.update((k, v) for k, v in config_dict.items() if v is not None)
-
-    for k, v in kwargs.items():
-        if k in ["role", "warehouse", "database", "schema_"]:
-            kwargs[k] = f'"{v}"'
-
-    kwargs["schema"] = kwargs.pop("schema_")
-
-    # https://docs.snowflake.com/en/user-guide/python-connector-example.html#using-key-pair-authentication-key-pair-rotation
-    # https://docs.snowflake.com/en/user-guide/key-pair-auth.html#configuring-key-pair-authentication
-    if "private_key" in kwargs:
-        kwargs["private_key"] = parse_private_key_path(
-            kwargs["private_key"], kwargs["private_key_passphrase"]
-        )
-
-    try:
-        conn = snowflake.connector.connect(
-            application="feast",
-            autocommit=autocommit,
-            **kwargs,
-        )
-
-        conn.cursor().execute("ALTER SESSION SET TIMEZONE = 'UTC'", _is_internal=True)
-
-        return conn
-    except KeyError as e:
-        raise SnowflakeIncompleteConfig(e)
-
-
-# Determine which set of credentials to use when using snowflake materialization engine
-# if snowflake.online -- this requires the online role to have access to source tables
-# if else -- this requires the offline role to have access to source tables
-def get_snowflake_materialization_config(repo_config: RepoConfig):
-    if repo_config.batch_engine.account:
-        conn_config = repo_config.batch_engine
-    elif repo_config.online_store.type == "snowflake.online":
-        conn_config = repo_config.online_store
+def get_snowflake_online_store_path(
+    config: RepoConfig,
+    feature_view: FeatureView,
+) -> str:
+    path_tag = "snowflake-online-store/online_path"
+    if path_tag in feature_view.tags:
+        online_path = feature_view.tags[path_tag]
     else:
-        conn_config = repo_config.offline_store
-    return conn_config
+        online_path = (
+            f'"{config.online_store.database}"."{config.online_store.schema_}"'
+        )
+
+    return online_path
 
 
 def package_snowpark_zip(project_name) -> Tuple[str, str]:

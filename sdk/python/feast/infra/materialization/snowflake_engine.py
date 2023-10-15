@@ -2,13 +2,13 @@ import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Callable, List, Literal, Optional, Sequence, Union
 
 import click
 import pandas as pd
 from colorama import Fore, Style
 from pydantic import Field, StrictStr
+from pytz import utc
 from tqdm import tqdm
 
 import feast
@@ -25,10 +25,11 @@ from feast.infra.offline_stores.offline_store import OfflineStore
 from feast.infra.online_stores.online_store import OnlineStore
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.infra.utils.snowflake.snowflake_utils import (
+    GetSnowflakeConnection,
     _run_snowflake_field_mapping,
     assert_snowflake_feature_names,
-    get_snowflake_conn,
-    get_snowflake_materialization_config,
+    execute_snowflake_statement,
+    get_snowflake_online_store_path,
     package_snowpark_zip,
 )
 from feast.protos.feast.types.EntityKey_pb2 import EntityKey as EntityKeyProto
@@ -45,9 +46,7 @@ class SnowflakeMaterializationEngineConfig(FeastConfigBaseModel):
     type: Literal["snowflake.engine"] = "snowflake.engine"
     """ Type selector"""
 
-    config_path: Optional[str] = (
-        Path(os.environ["HOME"]) / ".snowsql/config"
-    ).__str__()
+    config_path: Optional[str] = os.path.expanduser("~/.snowsql/config")
     """ Snowflake config path -- absolute path required (Cant use ~)"""
 
     account: Optional[str] = None
@@ -120,35 +119,37 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         entities_to_delete: Sequence[Entity],
         entities_to_keep: Sequence[Entity],
     ):
-        click.echo(
-            f"Deploying materialization functions for {Style.BRIGHT + Fore.GREEN}{project}{Style.RESET_ALL}"
-        )
-        click.echo()
-
-        conn_config = get_snowflake_materialization_config(self.repo_config)
-
-        stage_context = f'"{conn_config.database}"."{conn_config.schema_}"'
+        stage_context = f'"{self.repo_config.batch_engine.database}"."{self.repo_config.batch_engine.schema_}"'
         stage_path = f'{stage_context}."feast_{project}"'
-        with get_snowflake_conn(conn_config) as conn:
-            cur = conn.cursor()
+        with GetSnowflakeConnection(self.repo_config.batch_engine) as conn:
+            query = f"SHOW STAGES IN {stage_context}"
+            cursor = execute_snowflake_statement(conn, query)
+            stage_list = pd.DataFrame(
+                cursor.fetchall(),
+                columns=[column.name for column in cursor.description],
+            )
 
             # if the stage already exists,
             # assumes that the materialization functions have been deployed
-            cur.execute(f"SHOW STAGES IN {stage_context}")
-            stage_list = pd.DataFrame(
-                cur.fetchall(), columns=[column.name for column in cur.description]
-            )
             if f"feast_{project}" in stage_list["name"].tolist():
                 click.echo(
-                    f"Materialization functions for {Style.BRIGHT + Fore.GREEN}{project}{Style.RESET_ALL} already exists"
+                    f"Materialization functions for {Style.BRIGHT + Fore.GREEN}{project}{Style.RESET_ALL} already detected."
                 )
                 click.echo()
                 return None
 
-            cur.execute(f"CREATE STAGE {stage_path}")
+            click.echo(
+                f"Deploying materialization functions for {Style.BRIGHT + Fore.GREEN}{project}{Style.RESET_ALL}"
+            )
+            click.echo()
+
+            query = f"CREATE STAGE {stage_path}"
+            execute_snowflake_statement(conn, query)
 
             copy_path, zip_path = package_snowpark_zip(project)
-            cur.execute(f"PUT file://{zip_path} @{stage_path}")
+            query = f"PUT file://{zip_path} @{stage_path}"
+            execute_snowflake_statement(conn, query)
+
             shutil.rmtree(copy_path)
 
             # Execute snowflake python udf creation functions
@@ -159,8 +160,8 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
                 sqlCommands = sqlFile.split(";")
                 for command in sqlCommands:
                     command = command.replace("STAGE_HOLDER", f"{stage_path}")
-                    command = command.replace("PROJECT_NAME", f"{project}")
-                    cur.execute(command)
+                    query = command.replace("PROJECT_NAME", f"{project}")
+                    execute_snowflake_statement(conn, query)
 
         return None
 
@@ -170,15 +171,11 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         fvs: Sequence[Union[BatchFeatureView, StreamFeatureView, FeatureView]],
         entities: Sequence[Entity],
     ):
-        conn_config = get_snowflake_materialization_config(self.repo_config)
 
-        stage_path = (
-            f'"{conn_config.database}"."{conn_config.schema_}"."feast_{project}"'
-        )
-        with get_snowflake_conn(conn_config) as conn:
-            cur = conn.cursor()
-
-            cur.execute(f"DROP STAGE IF EXISTS {stage_path}")
+        stage_path = f'"{self.repo_config.batch_engine.database}"."{self.repo_config.batch_engine.schema_}"."feast_{project}"'
+        with GetSnowflakeConnection(self.repo_config.batch_engine) as conn:
+            query = f"DROP STAGE IF EXISTS {stage_path}"
+            execute_snowflake_statement(conn, query)
 
             # Execute snowflake python udf deletion functions
             sql_function_file = f"{os.path.dirname(feast.__file__)}/infra/utils/snowflake/snowpark/snowflake_python_udfs_deletion.sql"
@@ -187,8 +184,8 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
 
                 sqlCommands = sqlFile.split(";")
                 for command in sqlCommands:
-                    command = command.replace("PROJECT_NAME", f"{project}")
-                    cur.execute(command)
+                    query = command.replace("PROJECT_NAME", f"{project}")
+                    execute_snowflake_statement(conn, query)
 
         return None
 
@@ -239,8 +236,6 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
             feature_view, FeatureView
         ), "Snowflake can only materialize FeatureView & BatchFeatureView feature view types."
 
-        repo_config = self.repo_config
-
         entities = []
         for entity_name in feature_view.entities:
             entities.append(registry.get_entity(entity_name, project))
@@ -256,7 +251,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
 
         try:
             offline_job = self.offline_store.pull_latest_from_table_or_query(
-                config=repo_config,
+                config=self.repo_config,
                 data_source=feature_view.batch_source,
                 join_key_columns=join_key_columns,
                 feature_name_columns=feature_name_columns,
@@ -266,34 +261,80 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
                 end_date=end_date,
             )
 
+            # Lets check and see if we can skip this query, because the table hasnt changed
+            # since before the start date of this query
+            with GetSnowflakeConnection(self.repo_config.offline_store) as conn:
+                query = f"""SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME('{feature_view.batch_source.get_table_query_string()}') AS last_commit_change_time"""
+                last_commit_change_time = (
+                    execute_snowflake_statement(conn, query).fetchall()[0][0]
+                    / 1_000_000_000
+                )
+            if last_commit_change_time < start_date.astimezone(tz=utc).timestamp():
+                return SnowflakeMaterializationJob(
+                    job_id=job_id, status=MaterializationJobStatus.SUCCEEDED
+                )
+
             fv_latest_values_sql = offline_job.to_sql()
+
+            if feature_view.entity_columns:
+                join_keys = [entity.name for entity in feature_view.entity_columns]
+                unique_entities = '"' + '", "'.join(join_keys) + '"'
+
+                query = f"""
+                    SELECT
+                        COUNT(DISTINCT {unique_entities})
+                    FROM
+                        {feature_view.batch_source.get_table_query_string()}
+                """
+
+                with GetSnowflakeConnection(self.repo_config.offline_store) as conn:
+                    entities_to_write = conn.cursor().execute(query).fetchall()[0][0]
+            else:
+                entities_to_write = (
+                    1  # entityless feature view has a placeholder entity
+                )
 
             if feature_view.batch_source.field_mapping is not None:
                 fv_latest_mapped_values_sql = _run_snowflake_field_mapping(
                     fv_latest_values_sql, feature_view.batch_source.field_mapping
                 )
 
-            fv_to_proto_sql = self.generate_snowflake_materialization_query(
-                repo_config,
-                fv_latest_mapped_values_sql,
-                feature_view,
-                project,
-            )
+            features_full_list = feature_view.features
+            feature_batches = [
+                features_full_list[i : i + 100]
+                for i in range(0, len(features_full_list), 100)
+            ]
 
-            if repo_config.online_store.type == "snowflake.online":
-                self.materialize_to_snowflake_online_store(
-                    repo_config,
-                    fv_to_proto_sql,
-                    feature_view,
-                    project,
-                )
+            if self.repo_config.online_store.type == "snowflake.online":
+                rows_to_write = entities_to_write * len(features_full_list)
             else:
-                self.materialize_to_external_online_store(
-                    repo_config,
-                    fv_to_proto_sql,
-                    feature_view,
-                    tqdm_builder,
-                )
+                rows_to_write = entities_to_write * len(feature_batches)
+
+            with tqdm_builder(rows_to_write) as pbar:
+                for i, feature_batch in enumerate(feature_batches):
+                    fv_to_proto_sql = self.generate_snowflake_materialization_query(
+                        self.repo_config,
+                        fv_latest_mapped_values_sql,
+                        feature_view,
+                        feature_batch,
+                        project,
+                    )
+
+                    if self.repo_config.online_store.type == "snowflake.online":
+                        self.materialize_to_snowflake_online_store(
+                            self.repo_config,
+                            fv_to_proto_sql,
+                            feature_view,
+                            project,
+                        )
+                        pbar.update(entities_to_write * len(feature_batch))
+                    else:
+                        self.materialize_to_external_online_store(
+                            self.repo_config,
+                            fv_to_proto_sql,
+                            feature_view,
+                            pbar,
+                        )
 
             return SnowflakeMaterializationJob(
                 job_id=job_id, status=MaterializationJobStatus.SUCCEEDED
@@ -308,6 +349,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         repo_config: RepoConfig,
         fv_latest_mapped_values_sql: str,
         feature_view: Union[BatchFeatureView, FeatureView],
+        feature_batch: list,
         project: str,
     ) -> str:
 
@@ -330,7 +372,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         UDF serialization function.
         """
         feature_sql_list = []
-        for feature in feature_view.features:
+        for feature in feature_batch:
             feature_value_type_name = feature.dtype.to_value_type().name
 
             feature_sql = _convert_value_name_to_snowflake_udf(
@@ -338,7 +380,11 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
             )
 
             if feature_value_type_name == "UNIX_TIMESTAMP":
-                feature_sql = f'{feature_sql}(DATE_PART(EPOCH_NANOSECOND, "{feature.name}")) AS "{feature.name}"'
+                feature_sql = f'{feature_sql}(DATE_PART(EPOCH_NANOSECOND, "{feature.name}"::TIMESTAMP_LTZ)) AS "{feature.name}"'
+            elif feature_value_type_name == "DOUBLE":
+                feature_sql = (
+                    f'{feature_sql}("{feature.name}"::DOUBLE) AS "{feature.name}"'
+                )
             else:
                 feature_sql = f'{feature_sql}("{feature.name}") AS "{feature.name}"'
 
@@ -373,10 +419,6 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
     ) -> None:
         assert_snowflake_feature_names(feature_view)
 
-        conn_config = get_snowflake_materialization_config(repo_config)
-
-        online_table = f"""{repo_config.online_store.database}"."{repo_config.online_store.schema_}"."[online-transient] {project}_{feature_view.name}"""
-
         feature_names_str = '", "'.join(
             [feature.name for feature in feature_view.features]
         )
@@ -386,8 +428,13 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         else:
             fv_created_str = None
 
-        fv_to_online = f"""
-            MERGE INTO "{online_table}" online_table
+        online_path = get_snowflake_online_store_path(repo_config, feature_view)
+        online_table = (
+            f'{online_path}."[online-transient] {project}_{feature_view.name}"'
+        )
+
+        query = f"""
+            MERGE INTO {online_table} online_table
               USING (
                 SELECT
                   "entity_key" || TO_BINARY("feature_name", 'UTF-8') AS "entity_feature_key",
@@ -420,14 +467,9 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
                 )
         """
 
-        with get_snowflake_conn(conn_config) as conn:
-            cur = conn.cursor()
-            cur.execute(fv_to_online)
+        with GetSnowflakeConnection(repo_config.batch_engine) as conn:
+            execute_snowflake_statement(conn, query).sfqid
 
-            query_id = cur.sfqid
-            click.echo(
-                f"Snowflake Query ID: {Style.BRIGHT + Fore.GREEN}{query_id}{Style.RESET_ALL}"
-            )
         return None
 
     def materialize_to_external_online_store(
@@ -435,18 +477,15 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         repo_config: RepoConfig,
         materialization_sql: str,
         feature_view: Union[StreamFeatureView, FeatureView],
-        tqdm_builder: Callable[[int], tqdm],
+        pbar: tqdm,
     ) -> None:
-        conn_config = get_snowflake_materialization_config(repo_config)
 
         feature_names = [feature.name for feature in feature_view.features]
 
-        with get_snowflake_conn(conn_config) as conn:
-            cur = conn.cursor()
-            cur.execute(materialization_sql)
-            for i, df in enumerate(cur.fetch_pandas_batches()):
-                click.echo(f"Snowflake: Processing ResultSet Batch #{i+1}")
-
+        with GetSnowflakeConnection(repo_config.batch_engine) as conn:
+            query = materialization_sql
+            cursor = execute_snowflake_statement(conn, query)
+            for i, df in enumerate(cursor.fetch_pandas_batches()):
                 entity_keys = (
                     df["entity_key"].apply(EntityKeyProto.FromString).to_numpy()
                 )
@@ -482,11 +521,10 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
                     )
                 )
 
-                with tqdm_builder(len(rows_to_write)) as pbar:
-                    self.online_store.online_write_batch(
-                        repo_config,
-                        feature_view,
-                        rows_to_write,
-                        lambda x: pbar.update(x),
-                    )
+                self.online_store.online_write_batch(
+                    repo_config,
+                    feature_view,
+                    rows_to_write,
+                    lambda x: pbar.update(x),
+                )
         return None

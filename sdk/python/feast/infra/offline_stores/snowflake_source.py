@@ -1,3 +1,4 @@
+import warnings
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
 from typeguard import typechecked
@@ -40,14 +41,16 @@ class SnowflakeSource(DataSource):
         Creates a SnowflakeSource object.
 
         Args:
-            name (optional): Name for the source. Defaults to the table if not specified.
+            name (optional): Name for the source. Defaults to the table if not specified, in which
+                case the table must be specified.
             timestamp_field (optional): Event timestamp field used for point in time
                 joins of feature values.
             database (optional): Snowflake database where the features are stored.
-            warehouse (optional): Snowflake warehouse where the database is stored.
             schema (optional): Snowflake schema in which the table is located.
-            table (optional): Snowflake table where the features are stored.
-            query (optional): The query to be executed to obtain the features.
+            table (optional): Snowflake table where the features are stored. Exactly one of 'table'
+                and 'query' must be specified.
+            query (optional): The query to be executed to obtain the features. Exactly one of 'table'
+                and 'query' must be specified.
             created_timestamp_column (optional): Timestamp column indicating when the
                 row was created, used for deduplicating rows.
             field_mapping (optional): A dictionary mapping of column names in this data
@@ -57,6 +60,14 @@ class SnowflakeSource(DataSource):
             owner (optional): The owner of the snowflake source, typically the email of the primary
                 maintainer.
         """
+
+        if warehouse:
+            warnings.warn(
+                "Specifying a warehouse within a SnowflakeSource is to be deprecated."
+                "Starting v0.32.0, the warehouse as part of the Snowflake store config will be used.",
+                RuntimeWarning,
+            )
+
         if table is None and query is None:
             raise ValueError('No "table" or "query" argument provided.')
         if table and query:
@@ -70,7 +81,6 @@ class SnowflakeSource(DataSource):
             schema=_schema,
             table=table,
             query=query,
-            warehouse=warehouse,
         )
 
         # If no name, use the table as the default name.
@@ -106,7 +116,6 @@ class SnowflakeSource(DataSource):
             database=data_source.snowflake_options.database,
             schema=data_source.snowflake_options.schema,
             table=data_source.snowflake_options.table,
-            warehouse=data_source.snowflake_options.warehouse,
             created_timestamp_column=data_source.created_timestamp_column,
             field_mapping=dict(data_source.field_mapping),
             query=data_source.snowflake_options.query,
@@ -131,7 +140,6 @@ class SnowflakeSource(DataSource):
             and self.schema == other.schema
             and self.table == other.table
             and self.query == other.query
-            and self.warehouse == other.warehouse
         )
 
     @property
@@ -153,11 +161,6 @@ class SnowflakeSource(DataSource):
     def query(self):
         """Returns the snowflake options of this snowflake source."""
         return self.snowflake_options.query
-
-    @property
-    def warehouse(self):
-        """Returns the warehouse of this snowflake source."""
-        return self.snowflake_options.warehouse
 
     def to_proto(self) -> DataSourceProto:
         """
@@ -208,32 +211,34 @@ class SnowflakeSource(DataSource):
         Args:
             config: A RepoConfig describing the feature repo
         """
-
         from feast.infra.offline_stores.snowflake import SnowflakeOfflineStoreConfig
         from feast.infra.utils.snowflake.snowflake_utils import (
+            GetSnowflakeConnection,
             execute_snowflake_statement,
-            get_snowflake_conn,
         )
 
         assert isinstance(config.offline_store, SnowflakeOfflineStoreConfig)
 
-        snowflake_conn = get_snowflake_conn(config.offline_store)
+        with GetSnowflakeConnection(config.offline_store) as conn:
+            query = f"SELECT * FROM {self.get_table_query_string()} LIMIT 5"
+            cursor = execute_snowflake_statement(conn, query)
 
-        query = f"SELECT * FROM {self.get_table_query_string()} LIMIT 5"
+            metadata = [
+                {
+                    "column_name": column.name,
+                    "type_code": column.type_code,
+                    "precision": column.precision,
+                    "scale": column.scale,
+                    "is_nullable": column.is_nullable,
+                    "snowflake_type": None,
+                }
+                for column in cursor.description
+            ]
 
-        result_cur = execute_snowflake_statement(snowflake_conn, query)
-
-        metadata = [
-            {
-                "column_name": column.name,
-                "type_code": column.type_code,
-                "precision": column.precision,
-                "scale": column.scale,
-                "is_nullable": column.is_nullable,
-                "snowflake_type": None,
-            }
-            for column in result_cur.description
-        ]
+            if cursor.fetch_pandas_all().empty:
+                raise DataSourceNotFoundException(
+                    "The following source:\n" + query + "\n ... is empty"
+                )
 
         for row in metadata:
             if row["type_code"] == 0:
@@ -244,12 +249,12 @@ class SnowflakeSource(DataSource):
                         row["snowflake_type"] = "NUMBER64"
                     else:
                         column = row["column_name"]
-                        query = f'SELECT MAX("{column}") AS "{column}" FROM {self.get_table_query_string()}'
 
-                        result = execute_snowflake_statement(
-                            snowflake_conn, query
-                        ).fetch_pandas_all()
-
+                        with GetSnowflakeConnection(config.offline_store) as conn:
+                            query = f'SELECT MAX("{column}") AS "{column}" FROM {self.get_table_query_string()}'
+                            result = execute_snowflake_statement(
+                                conn, query
+                            ).fetch_pandas_all()
                         if (
                             result.dtypes[column].name
                             in python_int_to_snowflake_type_map
@@ -258,39 +263,44 @@ class SnowflakeSource(DataSource):
                                 result.dtypes[column].name
                             ]
                         else:
+                            if len(result) > 0:
+                                max_value = result.iloc[0][0]
+                                if max_value is not None and len(str(max_value)) <= 9:
+                                    row["snowflake_type"] = "NUMBER32"
+                                    continue
+                                elif (
+                                    max_value is not None and len(str(max_value)) <= 18
+                                ):
+                                    row["snowflake_type"] = "NUMBER64"
+                                    continue
                             raise NotImplementedError(
-                                "Numbers larger than INT64 are not supported"
+                                "NaNs or Numbers larger than INT64 are not supported"
                             )
                 else:
-                    raise NotImplementedError(
-                        "The following Snowflake Data Type is not supported: DECIMAL -- Convert to DOUBLE"
-                    )
-            elif row["type_code"] in [3, 5, 9, 10, 12]:
+                    row["snowflake_type"] = "NUMBERwSCALE"
+
+            elif row["type_code"] in [5, 9, 10, 12]:
                 error = snowflake_unsupported_map[row["type_code"]]
                 raise NotImplementedError(
                     f"The following Snowflake Data Type is not supported: {error}"
                 )
-            elif row["type_code"] in [1, 2, 4, 6, 7, 8, 11, 13]:
+            elif row["type_code"] in [1, 2, 3, 4, 6, 7, 8, 11, 13]:
                 row["snowflake_type"] = snowflake_type_code_map[row["type_code"]]
             else:
                 raise NotImplementedError(
                     f"The following Snowflake Column is not supported: {row['column_name']} (type_code: {row['type_code']})"
                 )
 
-        if not result_cur.fetch_pandas_all().empty:
-            return [
-                (column["column_name"], column["snowflake_type"]) for column in metadata
-            ]
-        else:
-            raise DataSourceNotFoundException(
-                "The following source:\n" + query + "\n ... is empty"
-            )
+        return [
+            (column["column_name"], column["snowflake_type"]) for column in metadata
+        ]
 
 
 snowflake_type_code_map = {
     0: "NUMBER",
     1: "DOUBLE",
     2: "VARCHAR",
+    3: "DATE",
     4: "TIMESTAMP",
     6: "TIMESTAMP_LTZ",
     7: "TIMESTAMP_TZ",
@@ -300,7 +310,6 @@ snowflake_type_code_map = {
 }
 
 snowflake_unsupported_map = {
-    3: "DATE -- Convert to TIMESTAMP",
     5: "VARIANT -- Try converting to VARCHAR",
     9: "OBJECT -- Try converting to VARCHAR",
     10: "ARRAY -- Try converting to VARCHAR",
@@ -326,13 +335,11 @@ class SnowflakeOptions:
         schema: Optional[str],
         table: Optional[str],
         query: Optional[str],
-        warehouse: Optional[str],
     ):
         self.database = database or ""
         self.schema = schema or ""
         self.table = table or ""
         self.query = query or ""
-        self.warehouse = warehouse or ""
 
     @classmethod
     def from_proto(cls, snowflake_options_proto: DataSourceProto.SnowflakeOptions):
@@ -350,7 +357,6 @@ class SnowflakeOptions:
             schema=snowflake_options_proto.schema,
             table=snowflake_options_proto.table,
             query=snowflake_options_proto.query,
-            warehouse=snowflake_options_proto.warehouse,
         )
 
         return snowflake_options
@@ -367,7 +373,6 @@ class SnowflakeOptions:
             schema=self.schema,
             table=self.table,
             query=self.query,
-            warehouse=self.warehouse,
         )
 
         return snowflake_options_proto
@@ -384,7 +389,6 @@ class SavedDatasetSnowflakeStorage(SavedDatasetStorage):
             schema=None,
             table=table_ref,
             query=None,
-            warehouse=None,
         )
 
     @staticmethod

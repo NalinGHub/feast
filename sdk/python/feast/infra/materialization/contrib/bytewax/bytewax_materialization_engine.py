@@ -13,7 +13,7 @@ from tqdm import tqdm
 from feast import FeatureView, RepoConfig
 from feast.batch_feature_view import BatchFeatureView
 from feast.entity import Entity
-from feast.infra.materialization import (
+from feast.infra.materialization.batch_materialization_engine import (
     BatchMaterializationEngine,
     MaterializationJob,
     MaterializationTask,
@@ -23,7 +23,7 @@ from feast.infra.online_stores.online_store import OnlineStore
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.repo_config import FeastConfigBaseModel
 from feast.stream_feature_view import StreamFeatureView
-from feast.utils import _get_column_names
+from feast.utils import _get_column_names, get_default_yaml_file_path
 
 from .bytewax_materialization_job import BytewaxMaterializationJob
 
@@ -46,6 +46,27 @@ class BytewaxMaterializationEngineConfig(FeastConfigBaseModel):
     These environment variables can be used to reference Kubernetes secrets.
     """
 
+    image_pull_secrets: List[dict] = []
+    """ (optional) The secrets to use when pulling the image to run for the materialization job """
+
+    resources: dict = {}
+    """ (optional) The resource requests and limits for the materialization containers """
+
+    service_account_name: StrictStr = ""
+    """ (optional) The service account name to use when running the job """
+
+    annotations: dict = {}
+    """ (optional) Annotations to apply to the job container. Useful for linking the service account to IAM roles, operational metadata, etc  """
+
+    include_security_context_capabilities: bool = True
+    """ (optional)  Include security context capabilities in the init and job container spec """
+
+    labels: dict = {}
+    """ (optional) additional labels to append to kubernetes objects """
+
+    max_parallelism: int = 10
+    """ (optional) Maximum number of pods  (default 10) allowed to run in parallel per job"""
+
 
 class BytewaxMaterializationEngine(BatchMaterializationEngine):
     def __init__(
@@ -67,7 +88,7 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
         self.online_store = online_store
 
         # TODO: Configure k8s here
-        k8s_config.load_kube_config()
+        k8s_config.load_config()
 
         self.k8s_client = client.api_client.ApiClient()
         self.v1 = client.CoreV1Api(self.k8s_client)
@@ -157,9 +178,6 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
             # Create a k8s configmap with information needed by bytewax
             self._create_configuration_map(job_id, paths, feature_view, self.namespace)
 
-            # Create the k8s service definition, used for bytewax communication
-            self._create_service_definition(job_id, self.namespace)
-
             # Create the k8s job definition
             self._create_job_definition(
                 job_id,
@@ -175,24 +193,22 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
     def _create_configuration_map(self, job_id, paths, feature_view, namespace):
         """Create a Kubernetes configmap for this job"""
 
-        feature_store_configuration = yaml.dump(
-            yaml.safe_load(
-                self.repo_config.json(
-                    exclude={"repo_path"},
-                    exclude_unset=True,
-                )
-            )
-        )
+        repo_path = self.repo_config.repo_path
+        assert repo_path
+        feature_store_path = get_default_yaml_file_path(repo_path)
+        feature_store_configuration = feature_store_path.read_text()
 
         materialization_config = yaml.dump(
             {"paths": paths, "feature_view": feature_view.name}
         )
 
+        labels = {"feast-bytewax-materializer": "configmap"}
         configmap_manifest = {
             "kind": "ConfigMap",
             "apiVersion": "v1",
             "metadata": {
                 "name": f"feast-{job_id}",
+                "labels": {**labels, **self.batch_engine_config.labels},
             },
             "data": {
                 "feature_store.yaml": feature_store_configuration,
@@ -203,41 +219,6 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
             namespace=namespace,
             body=configmap_manifest,
         )
-
-    def _create_service_definition(self, job_id, namespace):
-        """Creates a kubernetes service definition.
-
-        This service definition is created to allow bytewax workers
-        to communicate with each other.
-        """
-        service_definition = {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": f"dataflow-{job_id}",
-                "namespace": namespace,
-            },
-            "spec": {
-                "clusterIP": "None",
-                "clusterIPs": ["None"],
-                "internalTrafficPolicy": "Cluster",
-                "ipFamilies": ["IPv4"],
-                "ipFamilyPolicy": "SingleStack",
-                "ports": [
-                    {
-                        "name": "worker",
-                        "port": 9999,
-                        "protocol": "TCP",
-                        "targetPort": 9999,
-                    }
-                ],
-                "selector": {"job-name": f"dataflow-{job_id}"},
-                "sessionAffinity": "None",
-                "type": "ClusterIP",
-            },
-        }
-
-        utils.create_from_dict(self.k8s_client, service_definition)
 
     def _create_job_definition(self, job_id, namespace, pods, env):
         """Create a kubernetes job definition."""
@@ -270,10 +251,6 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
                 "value": "false",
             },
             {
-                "name": "BYTEWAX_HOSTFILE_PATH",
-                "value": "/etc/bytewax/hostfile.txt",
-            },
-            {
                 "name": "BYTEWAX_STATEFULSET_NAME",
                 "value": f"dataflow-{job_id}",
             },
@@ -281,29 +258,40 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
         # Add any Feast configured environment variables
         job_env.extend(env)
 
+        securityContextCapabilities = None
+        if self.batch_engine_config.include_security_context_capabilities:
+            securityContextCapabilities = {
+                "add": ["NET_BIND_SERVICE"],
+                "drop": ["ALL"],
+            }
+
+        job_labels = {"feast-bytewax-materializer": "job"}
+        pod_labels = {"feast-bytewax-materializer": "pod"}
         job_definition = {
             "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": {
                 "name": f"dataflow-{job_id}",
                 "namespace": namespace,
+                "labels": {**job_labels, **self.batch_engine_config.labels},
             },
             "spec": {
                 "ttlSecondsAfterFinished": 3600,
                 "completions": pods,
-                "parallelism": pods,
+                "parallelism": min(pods, self.batch_engine_config.max_parallelism),
                 "completionMode": "Indexed",
                 "template": {
+                    "metadata": {
+                        "annotations": self.batch_engine_config.annotations,
+                        "labels": {**pod_labels, **self.batch_engine_config.labels},
+                    },
                     "spec": {
                         "restartPolicy": "Never",
                         "subdomain": f"dataflow-{job_id}",
+                        "imagePullSecrets": self.batch_engine_config.image_pull_secrets,
+                        "serviceAccountName": self.batch_engine_config.service_account_name,
                         "initContainers": [
                             {
-                                "command": [
-                                    "sh",
-                                    "-c",
-                                    f'set -ex\n# Generate hostfile.txt.\necho "dataflow-{job_id}-0.dataflow-{job_id}.{namespace}.svc.cluster.local:9999" > /etc/bytewax/hostfile.txt\nreplicas=$(($BYTEWAX_REPLICAS-1))\nx=1\nwhile [ $x -le $replicas ]\ndo\n  echo "dataflow-{job_id}-$x.dataflow-{job_id}.{namespace}.svc.cluster.local:9999" >> /etc/bytewax/hostfile.txt\n  x=$(( $x + 1 ))\ndone',
-                                ],
                                 "env": [
                                     {
                                         "name": "BYTEWAX_REPLICAS",
@@ -316,10 +304,7 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
                                 "resources": {},
                                 "securityContext": {
                                     "allowPrivilegeEscalation": False,
-                                    "capabilities": {
-                                        "add": ["NET_BIND_SERVICE"],
-                                        "drop": ["ALL"],
-                                    },
+                                    "capabilities": securityContextCapabilities,
                                     "readOnlyRootFilesystem": True,
                                 },
                                 "terminationMessagePath": "/dev/termination-log",
@@ -351,13 +336,10 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
                                         "protocol": "TCP",
                                     }
                                 ],
-                                "resources": {},
+                                "resources": self.batch_engine_config.resources,
                                 "securityContext": {
                                     "allowPrivilegeEscalation": False,
-                                    "capabilities": {
-                                        "add": ["NET_BIND_SERVICE"],
-                                        "drop": ["ALL"],
-                                    },
+                                    "capabilities": securityContextCapabilities,
                                     "readOnlyRootFilesystem": False,
                                 },
                                 "terminationMessagePath": "/dev/termination-log",
@@ -385,7 +367,7 @@ class BytewaxMaterializationEngine(BatchMaterializationEngine):
                                 "name": f"feast-{job_id}",
                             },
                         ],
-                    }
+                    },
                 },
             },
         }

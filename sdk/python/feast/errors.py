@@ -124,6 +124,11 @@ class FeastProviderNotSetError(Exception):
         super().__init__("Provider is not set, but is required")
 
 
+class FeastRegistryNotSetError(Exception):
+    def __init__(self):
+        super().__init__("Registry is not set, but is required")
+
+
 class FeastFeatureServerTypeSetError(Exception):
     def __init__(self, feature_server_type: str):
         super().__init__(
@@ -135,6 +140,13 @@ class FeastFeatureServerTypeInvalidError(Exception):
     def __init__(self, feature_server_type: str):
         super().__init__(
             f"Feature server type was set to {feature_server_type}, but this type is invalid"
+        )
+
+
+class FeastRegistryTypeInvalidError(Exception):
+    def __init__(self, registry_type: str):
+        super().__init__(
+            f"Feature server type was set to {registry_type}, but this type is invalid"
         )
 
 
@@ -315,6 +327,13 @@ class EntityTimestampInferenceException(Exception):
         )
 
 
+class FeatureViewMissingDuringFeatureServiceInference(Exception):
+    def __init__(self, feature_view_name: str, feature_service_name: str):
+        super().__init__(
+            f"Missing {feature_view_name} feature view during inference for {feature_service_name} feature service."
+        )
+
+
 class InvalidEntityType(Exception):
     def __init__(self, entity_type: type):
         super().__init__(
@@ -377,3 +396,22 @@ class InvalidFeaturesParameterType(Exception):
         super().__init__(
             f"Invalid `features` parameter type {type(features)}. Expected one of List[str] and FeatureService."
         )
+
+
+class EntitySQLEmptyResults(Exception):
+    def __init__(self, entity_sql: str):
+        super().__init__(
+            f"No entity values found from the specified SQL query to generate the entity dataframe: {entity_sql}."
+        )
+
+
+class EntityDFNotDateTime(Exception):
+    def __init__(self):
+        super().__init__(
+            "The entity dataframe specified does not have the timestamp field as a datetime."
+        )
+
+
+class PushSourceNotFoundException(Exception):
+    def __init__(self, push_source_name: str):
+        super().__init__(f"Unable to find push source '{push_source_name}'.")

@@ -51,6 +51,9 @@ from tests.integration.feature_repos.universal.feature_views import (
     create_order_feature_view,
     create_pushable_feature_view,
 )
+from tests.integration.feature_repos.universal.online_store.bigtable import (
+    BigtableOnlineStoreCreator,
+)
 from tests.integration.feature_repos.universal.online_store.datastore import (
     DatastoreOnlineStoreCreator,
 )
@@ -84,6 +87,18 @@ SNOWFLAKE_CONFIG = {
     "schema": "ONLINE",
 }
 
+BIGTABLE_CONFIG = {
+    "type": "bigtable",
+    "project_id": os.getenv("GCLOUD_PROJECT", "kf-feast"),
+    "instance": os.getenv("BIGTABLE_INSTANCE_ID", "feast-integration-tests"),
+}
+
+ROCKSET_CONFIG = {
+    "type": "rockset",
+    "api_key": os.getenv("ROCKSET_APIKEY", ""),
+    "host": os.getenv("ROCKSET_APISERVER", "api.rs2.usw2.rockset.com"),
+}
+
 OFFLINE_STORE_TO_PROVIDER_CONFIG: Dict[str, DataSourceCreator] = {
     "file": ("local", FileDataSourceCreator),
     "bigquery": ("gcp", BigQueryDataSourceCreator),
@@ -115,6 +130,12 @@ if os.getenv("FEAST_IS_LOCAL_TEST", "False") != "True":
     AVAILABLE_ONLINE_STORES["dynamodb"] = (DYNAMO_CONFIG, None)
     AVAILABLE_ONLINE_STORES["datastore"] = ("datastore", None)
     AVAILABLE_ONLINE_STORES["snowflake"] = (SNOWFLAKE_CONFIG, None)
+    AVAILABLE_ONLINE_STORES["bigtable"] = (BIGTABLE_CONFIG, None)
+
+    # Uncomment to test using private Rockset account. Currently not enabled as
+    # there is no dedicated Rockset instance for CI testing and there is no
+    # containerized version of Rockset.
+    # AVAILABLE_ONLINE_STORES["rockset"] = (ROCKSET_CONFIG, None)
 
 
 full_repo_configs_module = os.environ.get(FULL_REPO_CONFIGS_MODULE_ENV_NAME)
@@ -161,6 +182,7 @@ if os.getenv("FEAST_LOCAL_ONLINE_CONTAINER", "False").lower() == "true":
         "redis": (REDIS_CONFIG, RedisOnlineStoreCreator),
         "dynamodb": (DYNAMO_CONFIG, DynamoDBOnlineStoreCreator),
         "datastore": ("datastore", DatastoreOnlineStoreCreator),
+        "bigtable": ("bigtable", BigtableOnlineStoreCreator),
     }
 
     for key, replacement in replacements.items():
@@ -349,6 +371,7 @@ class Environment:
     python_feature_server: bool
     worker_id: str
     online_store_creator: Optional[OnlineStoreCreator] = None
+    fixture_request: Optional[pytest.FixtureRequest] = None
 
     def __post_init__(self):
         self.end_date = datetime.utcnow().replace(microsecond=0, second=0, minute=0)
@@ -437,7 +460,6 @@ def construct_test_environment(
         batch_engine=test_repo_config.batch_engine,
         repo_path=repo_dir_name,
         feature_server=feature_server,
-        go_feature_serving=test_repo_config.go_feature_serving,
         entity_key_serialization_version=entity_key_serialization_version,
     )
 
@@ -457,6 +479,7 @@ def construct_test_environment(
         python_feature_server=test_repo_config.python_feature_server,
         worker_id=worker_id,
         online_store_creator=online_creator,
+        fixture_request=fixture_request,
     )
 
     return environment

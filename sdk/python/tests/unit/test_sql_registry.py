@@ -28,6 +28,8 @@ from feast.entity import Entity
 from feast.errors import FeatureViewNotFoundException
 from feast.feature_view import FeatureView
 from feast.field import Field
+from feast.infra.infra_object import Infra
+from feast.infra.online_stores.sqlite import SqliteTable
 from feast.infra.registry.sql import SqlRegistry
 from feast.on_demand_feature_view import on_demand_feature_view
 from feast.repo_config import RegistryConfig
@@ -70,7 +72,7 @@ def pg_registry():
         path=f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{container_port}/{POSTGRES_DB}",
     )
 
-    yield SqlRegistry(registry_config, None)
+    yield SqlRegistry(registry_config, "project", None)
 
     container.stop()
 
@@ -89,7 +91,7 @@ def mysql_registry():
     container.start()
 
     # The log string uses '8.0.*' since the version might be changed as new Docker images are pushed.
-    log_string_to_wait_for = "/usr/sbin/mysqld: ready for connections. Version: '8.0.*'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306"
+    log_string_to_wait_for = "/usr/sbin/mysqld: ready for connections. Version: '(\d+(\.\d+){1,2})'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306"  # noqa: W605
     waited = wait_for_logs(
         container=container,
         predicate=log_string_to_wait_for,
@@ -104,7 +106,7 @@ def mysql_registry():
         path=f"mysql+mysqldb://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{container_port}/{POSTGRES_DB}",
     )
 
-    yield SqlRegistry(registry_config, None)
+    yield SqlRegistry(registry_config, "project", None)
 
     container.stop()
 
@@ -116,7 +118,7 @@ def sqlite_registry():
         path="sqlite://",
     )
 
-    yield SqlRegistry(registry_config, None)
+    yield SqlRegistry(registry_config, "project", None)
 
 
 @pytest.mark.skipif(
@@ -258,10 +260,20 @@ def test_apply_feature_view_success(sql_registry):
         and feature_view.features[3].dtype == Array(Bytes)
         and feature_view.entities[0] == "fs1_my_entity_1"
     )
+    assert feature_view.ttl == timedelta(minutes=5)
 
     # After the first apply, the created_timestamp should be the same as the last_update_timestamp.
     assert feature_view.created_timestamp == feature_view.last_updated_timestamp
 
+    # Modify the feature view and apply again to test if diffing the online store table works
+    fv1.ttl = timedelta(minutes=6)
+    sql_registry.apply_feature_view(fv1, project)
+    feature_views = sql_registry.list_feature_views(project)
+    assert len(feature_views) == 1
+    feature_view = sql_registry.get_feature_view("my_feature_view_1", project)
+    assert feature_view.ttl == timedelta(minutes=6)
+
+    # Delete feature view
     sql_registry.delete_feature_view("my_feature_view_1", project)
     feature_views = sql_registry.list_feature_views(project)
     assert len(feature_views) == 0
@@ -565,11 +577,97 @@ def test_apply_data_source(sql_registry):
         lazy_fixture("sqlite_registry"),
     ],
 )
+def test_registry_cache(sql_registry):
+    # Create Feature Views
+    batch_source = FileSource(
+        name="test_source",
+        file_format=ParquetFormat(),
+        path="file://feast/*",
+        timestamp_field="ts_col",
+        created_timestamp_column="timestamp",
+    )
+
+    entity = Entity(name="fs1_my_entity_1", join_keys=["test"])
+
+    fv1 = FeatureView(
+        name="my_feature_view_1",
+        schema=[
+            Field(name="fs1_my_feature_1", dtype=Int64),
+            Field(name="fs1_my_feature_2", dtype=String),
+            Field(name="fs1_my_feature_3", dtype=Array(String)),
+            Field(name="fs1_my_feature_4", dtype=Array(Bytes)),
+        ],
+        entities=[entity],
+        tags={"team": "matchmaking"},
+        source=batch_source,
+        ttl=timedelta(minutes=5),
+    )
+
+    project = "project"
+
+    # Register data source and feature view
+    sql_registry.apply_data_source(batch_source, project)
+    sql_registry.apply_feature_view(fv1, project)
+    registry_feature_views_cached = sql_registry.list_feature_views(
+        project, allow_cache=True
+    )
+    registry_data_sources_cached = sql_registry.list_data_sources(
+        project, allow_cache=True
+    )
+    # Not refreshed cache, so cache miss
+    assert len(registry_feature_views_cached) == 0
+    assert len(registry_data_sources_cached) == 0
+    sql_registry.refresh(project)
+    # Now objects exist
+    registry_feature_views_cached = sql_registry.list_feature_views(
+        project, allow_cache=True
+    )
+    registry_data_sources_cached = sql_registry.list_data_sources(
+        project, allow_cache=True
+    )
+    assert len(registry_feature_views_cached) == 1
+    assert len(registry_data_sources_cached) == 1
+    registry_feature_view = registry_feature_views_cached[0]
+    assert registry_feature_view.batch_source == batch_source
+    registry_data_source = registry_data_sources_cached[0]
+    assert registry_data_source == batch_source
+
+    sql_registry.teardown()
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and "GITHUB_REF" in os.environ,
+    reason="does not run on mac github actions",
+)
+@pytest.mark.parametrize(
+    "sql_registry",
+    [
+        lazy_fixture("mysql_registry"),
+        lazy_fixture("pg_registry"),
+        lazy_fixture("sqlite_registry"),
+    ],
+)
 def test_update_infra(sql_registry):
     # Create infra object
     project = "project"
     infra = sql_registry.get_infra(project=project)
 
+    assert len(infra.infra_objects) == 0
+
     # Should run update infra successfully
     sql_registry.update_infra(infra, project)
+
+    # Should run update infra successfully when adding
+    new_infra = Infra()
+    new_infra.infra_objects.append(
+        SqliteTable(
+            path="/tmp/my_path.db",
+            name="my_table",
+        )
+    )
+    sql_registry.update_infra(new_infra, project)
+    infra = sql_registry.get_infra(project=project)
+    assert len(infra.infra_objects) == 1
+
+    # Try again since second time, infra should be not-empty
     sql_registry.teardown()

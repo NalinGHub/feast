@@ -15,6 +15,7 @@ from feast.protos.feast.core.SavedDataset_pb2 import (
 )
 from feast.repo_config import RepoConfig
 from feast.saved_dataset import SavedDatasetStorage
+from feast.usage import get_user_agent
 from feast.value_type import ValueType
 
 
@@ -36,14 +37,18 @@ class BigQuerySource(DataSource):
         """Create a BigQuerySource from an existing table or query.
 
         Args:
-            name (optional): Name for the source. Defaults to the table if not specified.
+            name (optional): Name for the source. Defaults to the table if not specified, in which
+                case the table must be specified.
             timestamp_field (optional): Event timestamp field used for point in time
                 joins of feature values.
+            table (optional): BigQuery table where the features are stored. Exactly one of 'table'
+                and 'query' must be specified.
             table (optional): The BigQuery table where features can be found.
             created_timestamp_column (optional): Timestamp column when row was created, used for deduplicating rows.
             field_mapping (optional): A dictionary mapping of column names in this data source to feature names in a feature table
                 or view. Only used for feature columns, not entities or timestamp columns.
-            query (optional): SQL query to execute to generate data for this data source.
+            query (optional): The query to be executed to obtain the features. Exactly one of 'table'
+                and 'query' must be specified.
             description (optional): A human-readable description.
             tags (optional): A dictionary of key-value pairs to store arbitrary metadata.
             owner (optional): The owner of the bigquery source, typically the email of the primary
@@ -153,17 +158,31 @@ class BigQuerySource(DataSource):
     def get_table_column_names_and_types(
         self, config: RepoConfig
     ) -> Iterable[Tuple[str, str]]:
+        try:
+            from google.api_core import client_info as http_client_info
+        except ImportError as e:
+            from feast.errors import FeastExtrasDependencyImportError
+
+            raise FeastExtrasDependencyImportError("gcp", str(e))
+
         from google.cloud import bigquery
 
-        client = bigquery.Client()
+        project_id = (
+            config.offline_store.billing_project_id or config.offline_store.project_id
+        )
+        client = bigquery.Client(
+            project=project_id,
+            location=config.offline_store.location,
+            client_info=http_client_info.ClientInfo(user_agent=get_user_agent()),
+        )
         if self.table:
             schema = client.get_table(self.table).schema
             if not isinstance(schema[0], bigquery.schema.SchemaField):
                 raise TypeError("Could not parse BigQuery table schema.")
         else:
-            bq_columns_query = f"SELECT * FROM ({self.query}) LIMIT 1"
-            queryRes = client.query(bq_columns_query).result()
-            schema = queryRes.schema
+            bq_columns_query = f"SELECT * FROM ({self.query}) LIMIT 0"
+            query_res = client.query(bq_columns_query).result()
+            schema = query_res.schema
 
         name_type_pairs: List[Tuple[str, str]] = []
         for field in schema:

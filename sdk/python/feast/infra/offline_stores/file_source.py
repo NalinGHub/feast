@@ -56,7 +56,7 @@ class FileSource(DataSource):
             tags (optional): A dictionary of key-value pairs to store arbitrary metadata.
             owner (optional): The owner of the file source, typically the email of the primary
                 maintainer.
-            timestamp_field (optional): Event timestamp foe;d used for point in time
+            timestamp_field (optional): Event timestamp field used for point in time
                 joins of feature values.
 
         Examples:
@@ -158,11 +158,15 @@ class FileSource(DataSource):
         # Adding support for different file format path
         # based on S3 filesystem
         if filesystem is None:
-            schema = ParquetDataset(path).schema.to_arrow_schema()
+            schema = ParquetDataset(path, use_legacy_dataset=False).schema
+            if hasattr(schema, "names") and hasattr(schema, "types"):
+                # Newer versions of pyarrow doesn't have this method,
+                # but this field is good enough.
+                pass
+            else:
+                schema = schema.to_arrow_schema()
         else:
-            schema = ParquetDataset(
-                filesystem.open_input_file(path), filesystem=filesystem
-            ).schema
+            schema = ParquetDataset(path, filesystem=filesystem).schema
 
         return zip(schema.names, map(str, schema.types))
 

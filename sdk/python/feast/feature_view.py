@@ -35,7 +35,9 @@ from feast.protos.feast.core.FeatureView_pb2 import (
 from feast.protos.feast.core.FeatureView_pb2 import (
     MaterializationInterval as MaterializationIntervalProto,
 )
+from feast.types import from_value_type
 from feast.usage import log_exceptions
+from feast.value_type import ValueType
 
 warnings.simplefilter("once", DeprecationWarning)
 
@@ -83,7 +85,6 @@ class FeatureView(BaseFeatureView):
     ttl: Optional[timedelta]
     batch_source: DataSource
     stream_source: Optional[DataSource]
-    schema: List[Field]
     entity_columns: List[Field]
     features: List[Field]
     online: bool
@@ -115,6 +116,7 @@ class FeatureView(BaseFeatureView):
                 If a stream source, the source should contain a batch_source for backfills & batch materialization.
             schema (optional): The schema of the feature view, including feature, timestamp,
                 and entity columns.
+            # TODO: clarify that schema is only useful here...
             entities (optional): The list of entities with which this group of features is associated.
             ttl (optional): The amount of time this group of features lives. A ttl of 0 indicates that
                 this group of features lives forever. Note that large ttl's or a ttl of 0
@@ -132,7 +134,7 @@ class FeatureView(BaseFeatureView):
         self.name = name
         self.entities = [e.name for e in entities] if entities else [DUMMY_ENTITY_NAME]
         self.ttl = ttl
-        self.schema = schema or []
+        schema = schema or []
 
         # Initialize data sources.
         if (
@@ -155,19 +157,39 @@ class FeatureView(BaseFeatureView):
         features: List[Field] = []
         self.entity_columns = []
 
-        join_keys = []
+        join_keys: List[str] = []
         if entities:
             for entity in entities:
-                join_keys += entity.join_keys
+                join_keys.append(entity.join_key)
 
-        for field in self.schema:
+        # Ensure that entities have unique join keys.
+        if len(set(join_keys)) < len(join_keys):
+            raise ValueError(
+                "A feature view should not have entities that share a join key."
+            )
+
+        for field in schema:
             if field.name in join_keys:
                 self.entity_columns.append(field)
+
+                # Confirm that the inferred type matches the specified entity type, if it exists.
+                matching_entities = (
+                    [e for e in entities if e.join_key == field.name]
+                    if entities
+                    else []
+                )
+                assert len(matching_entities) == 1
+                entity = matching_entities[0]
+                if entity.value_type != ValueType.UNKNOWN:
+                    if from_value_type(entity.value_type) != field.dtype:
+                        raise ValueError(
+                            f"Entity {entity.name} has type {entity.value_type}, which does not match the inferred type {field.dtype}."
+                        )
             else:
                 features.append(field)
 
         # TODO(felixwang9817): Add more robust validation of features.
-        cols = [field.name for field in self.schema]
+        cols = [field.name for field in schema]
         for col in cols:
             if (
                 self.batch_source.field_mapping is not None
@@ -234,6 +256,10 @@ class FeatureView(BaseFeatureView):
     def join_keys(self) -> List[str]:
         """Returns a list of all the join keys."""
         return [entity.name for entity in self.entity_columns]
+
+    @property
+    def schema(self) -> List[Field]:
+        return list(set(self.entity_columns + self.features))
 
     def ensure_valid(self):
         """
@@ -374,7 +400,7 @@ class FeatureView(BaseFeatureView):
             feature_view.stream_source = stream_source
 
         # This avoids the deprecation warning.
-        feature_view.entities = feature_view_proto.spec.entities
+        feature_view.entities = list(feature_view_proto.spec.entities)
 
         # Instead of passing in a schema, we set the features and entity columns.
         feature_view.features = [
@@ -385,6 +411,12 @@ class FeatureView(BaseFeatureView):
             Field.from_proto(field_proto)
             for field_proto in feature_view_proto.spec.entity_columns
         ]
+
+        if len(feature_view.entities) != len(feature_view.entity_columns):
+            warnings.warn(
+                f"There are some mismatches in your feature view's registered entities. Please check if you have applied your entities correctly."
+                f"Entities: {feature_view.entities} vs Entity Columns: {feature_view.entity_columns}"
+            )
 
         # FeatureViewProjections are not saved in the FeatureView proto.
         # Create the default projection.
